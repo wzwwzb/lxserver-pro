@@ -1,3 +1,4 @@
+# Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 FROM alpine AS base
 
 FROM base AS builder
@@ -20,7 +21,7 @@ RUN apk add --update \
 FROM base AS final
 WORKDIR /server
 
-RUN apk add --update --no-cache nodejs \
+RUN apk add --update --no-cache nodejs ffmpeg \
   && (apk add --no-cache chromaprint || echo "chromaprint apk not found, will use bundled binary")
 
 COPY --from=builder ./source-code/build-output ./

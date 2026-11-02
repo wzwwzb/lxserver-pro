@@ -1,4 +1,19 @@
+<!-- Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md. -->
+
 # LX Music Sync Server (Enhanced Edition)
+
+> 本仓库是 [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver) 的**非官方、独立维护的二次开发版本**。感谢原项目作者及贡献者，以及上游 [LX Music](https://github.com/lyswhut) 社区。
+>
+> 本 Fork 用于学习交流，保留上游许可证和补充说明。下方部分徽章、文档、发行包和镜像链接指向上游；上游发行包不包含本仓库的新增改动。
+
+## 本 Fork 的主要修改
+
+- 增强自定义音乐目录与 Subsonic 客户端的本地曲库支持，支持浏览、搜索及读取本地歌词和封面。
+- 提供本地曲库歌词、封面的批量匹配与补全，并改进部分旧音乐标签的乱码识别。
+- 改进自定义音源接口兼容性、酷狗分享歌单读取和错误提示。
+- 调整 Docker Compose 的持久化、音乐目录映射和敏感配置，并优化部分服务响应。
+
+功能和适用范围以当前源码与具体部署配置为准；在线音乐及第三方资源的可用性和授权由各自提供方决定。
 
 ![lxserver](https://socialify.git.ci/XCQ0607/lxserver/image?description=1&forks=0&issues=0&logo=https://raw.githubusercontent.com/XCQ0607/lxserver/refs/heads/main/public/icon.svg&owner=1&pulls=0&stargazers=0&theme=Auto)
 
@@ -138,9 +153,9 @@ Web 播放器针对移动端进行了深度优化，手机浏览器访问也能�
 
 本项目基于 **Node.js** 开发，支持多种部署方式。
 
-### 方式一：桌面客户端
+### 方式一：上游桌面客户端
 
-可以通过桌面端更方便地运行 LX Music Sync Server，支持 Windows、macOS 和 Linux。
+以下桌面发行包由上游提供，不包含本 Fork 的改动。可以通过桌面端更方便地运行上游 LX Music Sync Server，支持 Windows、macOS 和 Linux。
 
 - **📦 最新版本下载**: [GitHub Releases](https://github.com/XCQ0607/lxserver/releases/latest)
 - **✨ 桌面端优势**:
@@ -150,12 +165,17 @@ Web 播放器针对移动端进行了深度优化，手机浏览器访问也能�
 
 ### 方式二：使用 Docker
 
-本项目支持从 Docker Hub 或 GitHub Packages 拉取镜像：
+部署当前仓库源码时，使用根目录的 `docker-compose.yml`，先复制并填写 `.env.example`。
+完整配置、启动、备份及反向代理说明见 [Docker Compose 部署指南](md/DOCKER_COMPOSE.md)。
+
+自定义本地曲库支持 [自动补全歌词](md/LOCAL_LYRICS.md) 和 [自动补全封面](md/LOCAL_COVERS.md)，只新增同名外置文件，保留原始音频及标签。
+
+以下 Docker Hub 和 GitHub Packages 镜像由上游发布，不包含本 Fork 的改动：
 
 - **Docker Hub**: `xcq0607/lxserver:latest`
 - **GitHub Packages**: `ghcr.io/xcq0607/lxserver:latest`
 
-**Docker Run 示例：**
+**上游镜像的 Docker Run 示例：**
 
 ```bash
 docker run -d \
@@ -169,7 +189,7 @@ docker run -d \
   xcq0607/lxserver:latest
 ```
 
-**Docker Compose 示例：**
+**上游镜像的 Docker Compose 示例：**
 
 新建 `docker-compose.yml` 文件：
 
@@ -200,7 +220,7 @@ services:
 
 ```bash
 # 1. 克隆项目
-git clone https://github.com/XCQ0607/lxserver.git && cd lxserver
+git clone https://github.com/wzwwzb/lxserver-pro.git && cd lxserver-pro
 
 # 2. 安装依赖并编译
 npm ci && npm run build
@@ -209,9 +229,11 @@ npm ci && npm run build
 npm start
 ```
 
-### 方式四：使用 Release 版本
+### 方式四：使用上游 Release 版本
 
-1. 在 GitHub Releases 下载压缩包。
+上游 Release 不包含本 Fork 的改动。
+
+1. 在上游 GitHub Releases 下载压缩包。
 2. 解压后运行 `npm install --production`。
 3. 执行 `npm start` 启动。
 
@@ -350,6 +372,7 @@ npm start
 
 ## 🤝 贡献与致谢
 
+- 本仓库 Fork 自 [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver)，感谢其作者与所有贡献者。
 - 修改自 [lyswhut/lx-music-sync-server](https://github.com/lyswhut/lx-music-sync-server)。
 - Web 播放器逻辑参考 [lx-music-desktop](https://github.com/lyswhut/lx-music-desktop)。
 
@@ -370,6 +393,8 @@ npm start
 </a>
 
 ## 📄 开源协议
+
+本 Fork 保留上游协议和版权声明；修改过的文件已标记，主要变更见上方说明。第三方组件和素材的已知许可及待核对项目见 [第三方资源说明](THIRD_PARTY_NOTICES.md)。
 
 本项目基于 Apache License 2.0 许可证发行，以下协议是对于 Apache License 2.0 的补充，如有冲突，以以下协议为准。
 

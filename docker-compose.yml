@@ -1,17 +1,42 @@
-version: '3.8'
-
+# Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 services:
   lx-sync-server:
+    # 从当前仓库构建，包含本地代码修改。
     build: .
     container_name: lx-sync-server
-    restart: always
+    restart: unless-stopped
     ports:
-      - "9527:9527"
+      # HOST_IP=127.0.0.1 时仅允许宿主机访问，适用于宿主机反向代理。
+      - "${HOST_IP:-0.0.0.0}:${HOST_PORT:-9527}:9527"
     volumes:
-      # 数据持久化
+      # 配置、用户、歌单、快照和日志（data/logs）。
       - ./data:/server/data
+      # 默认缓存和下载目录位于 data 外，需要单独持久化。
+      - ./cache:/server/cache
+      - ./music:/server/music
+      - ./cover_cache:/server/cover_cache
+      # 可写根目录，用于持久化曲库索引。
+      - ./data/library:/library
+      # 外部音乐库挂载到独立子目录，保留目录的读写权限。
+      - "${LOCAL_LIBRARY_HOST_PATH:?Set LOCAL_LIBRARY_HOST_PATH in .env}:${LOCAL_LIBRARY_CONTAINER_PATH:?Set LOCAL_LIBRARY_CONTAINER_PATH in .env}"
     environment:
-      # 环境变量配置，优先级高于 config.js
-      - NODE_ENV=production
-      # 示例：通过环境变量设置用户
-      # - LX_USER_myuser=mypassword
+      NODE_ENV: production
+      BIND_IP: 0.0.0.0
+      PORT: "9527"
+      DATA_PATH: /server/data
+      LOG_PATH: /server/data/logs
+      TZ: "${TZ:-Asia/Shanghai}"
+      SERVER_NAME: "${SERVER_NAME:-LX Sync Server}"
+      # 复制 .env.example 为 .env，并填写这三项后再启动。
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?请在 .env 中设置管理员密码 ADMIN_PASSWORD}"
+      ENABLE_WEBPLAYER_AUTH: "${ENABLE_WEBPLAYER_AUTH:-true}"
+      WEBPLAYER_PASSWORD: "${WEBPLAYER_PASSWORD:?请在 .env 中设置播放器访问密码 WEBPLAYER_PASSWORD}"
+      # 首次启动预置同步用户 user1；已有用户以后通过管理后台维护。
+      LX_USER_user1: "${LX_USER_user1:?请在 .env 中设置同步用户密码 LX_USER_user1}"
+      USER_ENABLE_PATH: "true"
+      USER_ENABLE_ROOT: "false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

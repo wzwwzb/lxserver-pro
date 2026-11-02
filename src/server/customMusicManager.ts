@@ -1,3 +1,4 @@
+// Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 import fs from 'fs'
 import path from 'path'
 import http from 'http'
@@ -9,6 +10,9 @@ import { formatPlayTime } from '@/utils/common'
 import { buildLyrics } from '@/utils/lrcTool'
 import { getLyricFetcher, embedLyricsIntoFile, getAudioMetadataUnsupportedStatus } from './fileCache'
 import * as fileCache from './fileCache'
+import { decodeMusicTags } from './musicTagEncoding'
+import { readSidecarLyrics, resolveLyricSong } from './customLyrics'
+import { findSidecarCover, readSidecarCover } from './customCovers'
 
 export interface CustomCacheItem {
     id: string
@@ -29,7 +33,9 @@ export interface CustomCacheItem {
     lyricFilename?: string
     ext: string
     hasCover?: boolean
-    coverType?: 'embedded' | 'cached' | 'remote' | 'none'
+    coverType?: 'embedded' | 'sidecar' | 'cached' | 'remote' | 'none'
+    coverFilename?: string
+    coverMtime?: number
     hasLyric?: boolean
     hasEmbedLyric?: boolean
     bitrate?: number
@@ -289,8 +295,30 @@ export const syncCustomIndex = async (username: string) => {
 
         const lrcFilePath = filePath.substring(0, filePath.length - ext.length) + '.lrc'
         const hasLyricOnDisk = fs.existsSync(lrcFilePath)
+        const sidecarCover = findSidecarCover(customDir, relPath)
+        const sidecarChanged = existing?.coverType === 'sidecar'
+            ? existing.coverFilename !== sidecarCover?.filename || existing.coverMtime !== sidecarCover?.mtime
+            : !!sidecarCover && existing?.coverType !== 'embedded'
 
-        if (existing && existing.size === stats.size && existing.mtime === stats.mtimeMs && existing.hasLyric === hasLyricOnDisk) {
+        if (existing && existing.size === stats.size && existing.mtime === stats.mtimeMs) {
+            // Migrate cached display text even when the audio itself is unchanged.
+            const decoded = decodeMusicTags(existing, relPath)
+            if (decoded.name !== existing.name || decoded.singer !== existing.singer || decoded.album !== existing.album) {
+                Object.assign(existing, { name: decoded.name, singer: decoded.singer, album: decoded.album })
+                updated = true
+            }
+            if (existing.hasLyric !== hasLyricOnDisk) {
+                existing.hasLyric = hasLyricOnDisk
+                existing.lyricFilename = hasLyricOnDisk ? relPath.substring(0, relPath.length - ext.length) + '.lrc' : undefined
+                updated = true
+            }
+            // Adding/removing a cover does not change the audio or its cached tags.
+            if (sidecarChanged) {
+                Object.assign(existing, sidecarCover
+                    ? { hasCover: true, coverType: 'sidecar', coverFilename: sidecarCover.filename, coverMtime: sidecarCover.mtime }
+                    : { hasCover: false, coverType: 'none', coverFilename: undefined, coverMtime: undefined })
+                updated = true
+            }
             continue
         }
 
@@ -330,6 +358,11 @@ export const syncCustomIndex = async (username: string) => {
         } finally {
             try { if (tagger) tagger.dispose() } catch (e) { }
         }
+
+        const decodedTags = decodeMusicTags({ name: songName, singer, album }, relPath)
+        songName = decodedTags.name
+        singer = decodedTags.singer
+        album = decodedTags.album
 
         // ② 元数据缺失时，尝试从文件名解析歌名/歌手（作为兜底）
         if (!songName || !singer) {
@@ -377,8 +410,10 @@ export const syncCustomIndex = async (username: string) => {
             mtime: stats.mtimeMs,
             size: stats.size,
             ext: ext.replace('.', ''),
-            hasCover: hasEmbedCover || !!borrowed?.hasCover || !!existing?.hasCover,
-            coverType: hasEmbedCover ? 'embedded' : (borrowed?.coverType || existing?.coverType || 'none'),
+            hasCover: hasEmbedCover || !!sidecarCover || !!borrowed?.hasCover || (existing?.coverType !== 'sidecar' && !!existing?.hasCover),
+            coverType: hasEmbedCover ? 'embedded' : sidecarCover ? 'sidecar' : (borrowed?.coverType || (existing?.coverType === 'sidecar' ? 'none' : existing?.coverType) || 'none'),
+            coverFilename: sidecarCover?.filename,
+            coverMtime: sidecarCover?.mtime,
             hasLyric: hasLyricOnDisk,
             hasEmbedLyric,
             lyricFilename: hasLyricOnDisk ? path.basename(lrcFilePath) : undefined,
@@ -407,7 +442,7 @@ export const syncCustomIndex = async (username: string) => {
 }
 
 // 获取自定义音乐列表（带 songInfo 转换）
-export const getCustomMusicList = async (username: string) => {
+export const getCustomMusicList = async (username: string, options: { includeCoverDetails?: boolean } = {}) => {
     const customDir = getCustomMusicDir(username)
     if (!customDir) return []
 
@@ -416,7 +451,18 @@ export const getCustomMusicList = async (username: string) => {
         await syncCustomIndex(username)
     }
 
-    const items = customIndexManager.getAll(username)
+    const items = customIndexManager.getAll(username).map(item => {
+        // Some callers only need song metadata and never use the cover fields.
+        // Checking every sidecar on each such request blocks the server on disk I/O.
+        const sidecar = options.includeCoverDetails === false || item.coverType === 'embedded'
+            ? null : findSidecarCover(customDir, item.filename)
+        return {
+            ...item, ...decodeMusicTags(item, item.filename),
+            ...(sidecar ? { hasCover: true, coverType: 'sidecar' as const, coverFilename: sidecar.filename, coverMtime: sidecar.mtime }
+                : options.includeCoverDetails !== false && item.coverType === 'sidecar'
+                    ? { hasCover: false, coverType: 'none' as const, coverFilename: undefined, coverMtime: undefined } : {}),
+        }
+    })
     return items.map(item => ({
         ...item,
         songInfo: {
@@ -437,15 +483,53 @@ export const getCustomMusicList = async (username: string) => {
     }))
 }
 
+// 外置歌词优先，其次读取内嵌歌词；供网页播放器及 Subsonic 共用。
+export const getCustomLocalLyrics = (filename: string, username: string): { lrc: string, source: string } => {
+    const root = getCustomMusicDir(username)
+    if (!root) return { lrc: '', source: 'none' }
+    const sidecar = readSidecarLyrics(root, filename)
+    if (sidecar.trim()) return { lrc: sidecar, source: 'sidecar' }
+    let tagger: any
+    try {
+        const { file } = resolveLyricSong(root, filename)
+        tagger = new MusicTagger()
+        tagger.loadPath(file)
+        return { lrc: String(tagger.lyrics || ''), source: 'embedded' }
+    } catch { return { lrc: '', source: 'none' } } finally {
+        try { tagger?.dispose() } catch { }
+    }
+}
+
+export const recordCustomLyricFile = (username: string, filename: string, lyricFilename: string) => {
+    const index = customIndexManager.load(username)
+    const item = index.get(filename)
+    if (!item) return
+    item.hasLyric = true
+    item.lyricFilename = lyricFilename
+    customIndexManager.set(username, filename, item)
+    customIndexManager.save(username)
+}
+
+export const recordCustomCoverFile = (username: string, filename: string, coverFilename: string) => {
+    const root = getCustomMusicDir(username)
+    if (!root) return
+    const sidecar = findSidecarCover(root, filename)
+    const index = customIndexManager.load(username)
+    const item = index.get(filename)
+    if (!item || !sidecar || sidecar.filename !== coverFilename) return
+    Object.assign(item, { hasCover: true, coverType: 'sidecar', coverFilename, coverMtime: sidecar.mtime })
+    customIndexManager.set(username, filename, item)
+    customIndexManager.save(username)
+}
+
 // 获取自定义目录音频封面
 export const getCustomCover = async (filename: string, username: string) => {
     const customDir = getCustomMusicDir(username)
     if (!customDir) return null
-    const filePath = resolveSafePath(customDir, filename)
-    if (!filePath || !fs.existsSync(filePath)) return null
 
     let tagger: any
     try {
+        const { file: filePath } = resolveLyricSong(customDir, filename)
         tagger = new MusicTagger()
         tagger.loadPath(filePath)
         const pics = tagger.pictures
@@ -462,7 +546,7 @@ export const getCustomCover = async (filename: string, username: string) => {
     } finally {
         try { if (tagger) tagger.dispose() } catch (e) { }
     }
-    return null
+    return readSidecarCover(customDir, filename)
 }
 
 // 流式服务自定义目录音频文件（支持 Range 206）
@@ -1068,4 +1152,3 @@ export const replaceCustomMusicItem = async (
         } catch (e) { }
     }
 }
-

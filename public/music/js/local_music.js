@@ -1,3 +1,4 @@
+// Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 /**
  * LocalMusicManager (本地音乐模块)
  * 处理在本地音乐Tab下的列表加载、刷选、删除功能
@@ -3142,7 +3143,7 @@ window.LocalMusicManager = {
                 if (item.hasCover || (item.img && typeof item.img === 'string' && /^https?:\/\//i.test(item.img))) {
                     const coverUrl = item.hasCover
                         ? (isCustomDir
-                            ? `/api/music/custom/cover?filename=${encodeURIComponent(item.filename)}&user=${encodeURIComponent(username)}${authToken ? `&token=${encodeURIComponent(authToken)}` : ''}&v=${encodeURIComponent([Math.round(item.mtime || 0), item.size || 0].join('-'))}`
+                            ? `/api/music/custom/cover?filename=${encodeURIComponent(item.filename)}&user=${encodeURIComponent(username)}${authToken ? `&token=${encodeURIComponent(authToken)}` : ''}&v=${encodeURIComponent([Math.round(item.mtime || 0), item.size || 0, Math.round(item.coverMtime || 0)].join('-'))}`
                             : `/api/music/cache/cover?filename=${encodeURIComponent(item.filename)}&user=${encodeURIComponent(username)}${authToken ? `&token=${encodeURIComponent(authToken)}` : ''}&v=${encodeURIComponent([item.coverCheckedVersion || 0, Math.round(item.coverCheckedMtime || item.mtime || 0), item.coverCheckedSize || item.size || 0, 1].join('-'))}`)
                         : item.img;
                     const fallbackAttr = item.img && item.img !== coverUrl ? `data-fallback-src="${this.escapeAttr(item.img)}"` : '';

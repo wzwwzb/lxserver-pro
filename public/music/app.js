@@ -1,3 +1,4 @@
+// Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 /*
  * Copyright 2026 xcq0607 (https://github.com/xcq0607)
  *
@@ -9777,7 +9778,7 @@ function updateDetailInfo(song) {
 
 
 /**
- * 读取本地未关联歌曲的内嵌歌词（或作为网络获取失败时的兜底）
+ * 读取本地歌曲的外置或内嵌歌词（或作为网络获取失败时的兜底）
  * @param {object} song 歌曲对象
  * @param {boolean} [silent=false] 是否静默模式（为 true 时若无内嵌歌词不覆盖 UI 为暂无歌词）
  * @returns {Promise<boolean>} 是否成功获取并应用了内嵌歌词
@@ -9790,7 +9791,7 @@ async function fetchEmbedLyricForLocalSong(song, silent = false) {
     // 显示加载状态（若非静默模式）
     if (!silent) {
         const lyricContent = document.getElementById('lyric-content');
-        if (lyricContent) lyricContent.innerHTML = '<p class="t-text-muted text-lg animate-pulse">正在加载内嵌歌词...</p>';
+        if (lyricContent) lyricContent.innerHTML = '<p class="t-text-muted text-lg animate-pulse">正在加载本地歌词...</p>';
         currentLyricLines = [];
     }
 
@@ -9814,7 +9815,7 @@ async function fetchEmbedLyricForLocalSong(song, silent = false) {
         if (!data.success || !lrc || lrc.trim().length < 5) {
             console.log('[Lyric] 内嵌歌词为空，无歌词展示');
             if (!silent) {
-                renderLyric([], '暂无内嵌歌词');
+                renderLyric([], '暂无本地歌词');
             }
             return false;
         }

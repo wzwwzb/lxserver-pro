@@ -1,3 +1,4 @@
+// Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 import { httpFetch } from '../../request'
 import { decodeName, formatPlayTime, sizeFormate, dateFormat, formatPlayCount } from '../../index'
 import infSign from '@renderer/utils/musicSdk/kg/vendors/infSign.min'
@@ -12,6 +13,24 @@ const handleSignature = (id, page, limit) => new Promise((resolve, reject) => {
     },
   })
 })
+
+const signSharedPlaylistPage = (id, page, limit, type) => new Promise(resolve => {
+  infSign({
+    mid: '-', uid: 0, appid: 1058, token: '', dfid: '-', type,
+    module: 'playlist', page, pagesize: limit, global_collection_id: id,
+  }, null, { useH5: true, isCDN: true, callback: resolve })
+})
+
+// Newer Kugou share pages carry the collection identifier in either field.
+const getSharedCollectionId = value => {
+  try {
+    const url = new URL(value)
+    const id = url.searchParams.get('global_collection_id') || url.searchParams.get('global_specialid')
+    return id && /^\w{1,1000}$/.test(id) ? id : null
+  } catch {
+    return null
+  }
+}
 
 export default {
   _requestObj_tags: null,
@@ -266,6 +285,17 @@ export default {
       return this.createHttp(url, options, ++retryNum)
     }
     // console.log(result.statusCode, result.body)
+    const errorCode = result.body?.error_code ?? result.body?.errcode ?? result.body?.err_code
+    if (Number(errorCode) === 20028) {
+      if (result.headers?.['ssa-code']) {
+        const error = new Error('酷狗要求安全验证，暂时无法读取歌单')
+        error.code = 'KG_VERIFICATION_REQUIRED'
+        throw error
+      }
+      const error = new Error('酷狗限制了请求频率，请稍后再试')
+      error.code = 'KG_RATE_LIMITED'
+      throw error
+    }
     if (result.statusCode !== 200 ||
       (
         (result.body.error_code !== undefined
@@ -316,13 +346,14 @@ export default {
     }).then(data => data.map(s => s[0])))
   },
   async getMusicInfos(list) {
-    return this.filterData2(
-      await Promise.all(
-        this.createTask(
-          this.deDuplication(list)
-            .map(item => ({ hash: item.hash })),
-        ))
-        .then(([...datas]) => datas.flat()))
+    const hashes = this.deDuplication(list).map(item => ({ hash: item.hash }))
+    const songs = []
+    // Limit parallel metadata requests for large playlists.
+    for (let offset = 0; offset < hashes.length; offset += 200) {
+      const pages = await Promise.all(this.createTask(hashes.slice(offset, offset + 200)))
+      songs.push(...pages.flat())
+    }
+    return this.filterData2(songs)
   },
 
   async getUserListDetailByCode(id) {
@@ -470,25 +501,41 @@ export default {
       },
     }
   },
-  createGetListDetail2Task(id, total) {
-    let tasks = []
-    let page = 0
-    while (total) {
-      const limit = total > 300 ? 300 : total
-      total -= limit
-      page += 1
-      const params = 'appid=1058&global_specialid=' + id + '&specialid=0&plat=0&version=8000&page=' + page + '&pagesize=' + limit + '&srcappid=2919&clientver=20000&clienttime=1586163263991&mid=1586163263991&uuid=1586163263991&dfid=-'
-      tasks.push(this.createHttp(`https://mobiles.kugou.com/api/v5/special/song_v2?${params}&signature=${signatureParams(params, 'web')}`, {
+  async createGetListDetail2Task(id, total, type = 0) {
+    const songs = []
+    total = Number(total)
+    if (!Number.isSafeInteger(total) || total < 0 || total > 100000) throw new Error('酷狗歌单歌曲数量无效')
+    if (!total) return songs
+    let page = 1
+    let limit = 300
+    let expected = null
+    while (true) {
+      // This is the playlist endpoint used by Kugou's share page.
+      const params = await signSharedPlaylistPage(id, page, limit, Number(type) || 0)
+      const data = await this.createHttp(`https://pubsongscdn.kugou.com/v2/get_other_list_file?${new URLSearchParams(params)}`, {
         headers: {
-          mid: '1586163263991',
-          Referer: 'https://m3ws.kugou.com/share/index.php',
-          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-          dfid: '-',
-          clienttime: '1586163263991',
+          Referer: 'https://activity.kugou.com/',
+          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1',
         },
-      }).then(data => data.info))
+      })
+      if (!Array.isArray(data?.info)) throw new Error('酷狗没有返回有效的歌曲列表')
+      const count = data.count == null ? NaN : Number(data.count)
+      const pageSize = data.pagesize == null ? NaN : Number(data.pagesize)
+      if (!Number.isSafeInteger(count) || count < 0 || count > 100000 ||
+        !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > limit || data.info.length > pageSize) {
+        throw new Error('酷狗返回的歌单分页信息无效')
+      }
+      if (expected !== null && (count !== expected || pageSize !== limit)) {
+        throw new Error('酷狗歌单在加载时发生变化，请重新打开')
+      }
+      expected = count
+      limit = pageSize
+      songs.push(...data.info)
+      if (songs.length > expected) throw new Error('酷狗返回的歌单歌曲数量不一致')
+      if (songs.length === expected) return songs
+      if (!data.info.length) throw new Error('酷狗返回的歌单不完整，请稍后重试')
+      page += 1
     }
-    return Promise.all(tasks).then(([...datas]) => datas.flat())
   },
   async getUserListDetail2(global_collection_id) {
     let id = global_collection_id
@@ -503,7 +550,7 @@ export default {
         clienttime: '1586163242519',
       },
     })
-    const songInfo = await this.createGetListDetail2Task(id, info.songcount)
+    const songInfo = await this.createGetListDetail2Task(id, info.songcount, info.type)
     let list = await this.getMusicInfos(songInfo)
     // console.log(info, songInfo, list)
     return {
@@ -518,6 +565,7 @@ export default {
         desc: info.intro,
         author: info.nickname,
         play_count: formatPlayCount(info.playcount),
+        unavailableCount: Math.max(0, Number(info.songcount) - songInfo.length),
       },
     }
   },
@@ -613,7 +661,8 @@ export default {
   async getUserListDetail(link, page, retryNum = 0) {
     if (retryNum > 3) return Promise.reject(new Error('link try max num'))
     if (link.includes('#')) link = link.replace(/#.*$/, '')
-    if (link.includes('global_collection_id')) return this.getUserListDetail2(link.replace(/^.*?global_collection_id=(\w+)(?:&.*$|#.*$|$)/, '$1'))
+    const sharedCollectionId = getSharedCollectionId(link)
+    if (sharedCollectionId) return this.getUserListDetail2(sharedCollectionId)
     if (link.includes('gcid_')) {
       let gcid = link.match(/gcid_\w+/)?.[0]
       if (gcid) {
@@ -644,7 +693,8 @@ export default {
     if (statusCode > 400) return this.getUserListDetail(link, page, ++retryNum)
     if (location) {
       // console.log(location)
-      if (location.includes('global_collection_id')) return this.getUserListDetail2(location.replace(/^.*?global_collection_id=(\w+)(?:&.*$|#.*$|$)/, '$1'))
+      const redirectedCollectionId = getSharedCollectionId(new URL(location, link).href)
+      if (redirectedCollectionId) return this.getUserListDetail2(redirectedCollectionId)
       if (location.includes('gcid_')) {
         let gcid = link.match(/gcid_\w+/)?.[0]
         if (gcid) {
@@ -683,6 +733,7 @@ export default {
 
   async getListDetail(id, page) { // 获取歌曲列表内的音乐
     id = id.toString()
+    if (/^collection_\w{1,989}$/.test(id)) return this.getUserListDetail2(id)
     if (id.includes('special/single/')) {
       id = id.replace(this.regExps.listDetailLink, '$1')
     } else if (/https?:/.test(id)) {

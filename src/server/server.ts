@@ -1,8 +1,10 @@
+// Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 import http, { type IncomingMessage } from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import url from 'node:url'
+import { gzip } from 'node:zlib'
 import { WebSocketServer, WebSocket } from 'ws'
 import { registerLocalSyncEvent, callObj, sync } from './sync'
 import { authCode, authConnect } from './auth'
@@ -28,6 +30,8 @@ import { initUserApis, callUserApiGetMusicUrl, isSourceSupported, getLoadedApis,
 import * as customSourceHandlers from './customSourceHandlers'
 import * as fileCache from './fileCache'
 import * as customMusicManager from './customMusicManager'
+import { createCustomLyricsManager, withLyricTimeout } from './customLyrics'
+import { createCustomCoversManager, downloadCoverImage } from './customCovers'
 import * as serverDownloadQueue from './serverDownloadQueue'
 import * as remasterQueue from './remasterQueue'
 import * as scheduler from './scheduler'
@@ -38,6 +42,41 @@ import crypto from 'node:crypto'
 import needle from 'needle'
 import { getProxyAgent } from '../modules/utils/proxy.js'
 const { MusicTagger, MetaPicture } = require('music-tag-native')
+
+const customLyricsManager = createCustomLyricsManager({
+  getRoot: username => global.lx.config['user.enableCustomMusicDir'] ? customMusicManager.getCustomMusicDir(username) : null,
+  canWrite: username => !!global.lx.config['user.enableCustomMusicDir'] && !!getUserConfig(username)?.allowWriteCustomMusicDir,
+  list: username => customMusicManager.getCustomMusicList(username),
+  reportPath: username => path.join(global.lx.userPath, getUserDirname(username), 'custom-lyrics-job.json'),
+  search: async (source, query) => {
+    const result = await musicSdk[source].musicSearch.search(query, 1, 10)
+    return result?.list || []
+  },
+  fetchLyrics: async (source, song) => {
+    const request = musicSdk[source].getLyric({ ...song, songmid: song.songmid || song.id })
+    try { return await withLyricTimeout(request.promise, 8000) } finally {
+      try { request.cancel?.() } catch { }
+    }
+  },
+  onSaved: customMusicManager.recordCustomLyricFile,
+})
+
+const customCoversManager = createCustomCoversManager({
+  getRoot: username => global.lx.config['user.enableCustomMusicDir'] ? customMusicManager.getCustomMusicDir(username) : null,
+  canWrite: username => !!global.lx.config['user.enableCustomMusicDir'] && !!getUserConfig(username)?.allowWriteCustomMusicDir,
+  list: username => customMusicManager.getCustomMusicList(username),
+  hasCover: async (username, filename) => !!await customMusicManager.getCustomCover(filename, username),
+  reportPath: username => path.join(global.lx.userPath, getUserDirname(username), 'custom-covers-job.json'),
+  search: async (source, query) => {
+    const result = await musicSdk[source].musicSearch.search(query, 1, 10)
+    return result?.list || []
+  },
+  fetchCover: async (source, song) => {
+    const url = song.img || await musicSdk[source].getPic({ ...song, songmid: song.songmid || song.id })
+    return downloadCoverImage(url, { getAgent: address => getProxyAgent(address, 'app') })
+  },
+  onSaved: customMusicManager.recordCustomCoverFile,
+})
 
 /** 当前生效的 dislike 匹配选项，下发给前端保证前后端判定一致 */
 const dislikeMatchOptions = () => ({
@@ -1047,6 +1086,40 @@ const isPathInside = (child: string, parent: string): boolean => {
   return resolvedChild.startsWith(withSep)
 }
 
+const acceptsGzip = (req: IncomingMessage): boolean => {
+  let explicit: number | undefined
+  let wildcard: number | undefined
+  for (const part of (req.headers['accept-encoding'] || '').split(',')) {
+    const [name, ...parameters] = part.trim().toLowerCase().split(';')
+    if (name !== 'gzip' && name !== '*') continue
+    const quality = parameters.map(value => value.trim()).find(value => value.startsWith('q='))
+    const parsed = quality ? Number(quality.slice(2)) : 1
+    const value = Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 0
+    if (name === 'gzip') explicit = value
+    else wildcard = value
+  }
+  return (explicit ?? wildcard ?? 0) > 0
+}
+
+// Compress text responses only when the client accepts gzip; cache variants separately.
+const sendCompressible = (req: IncomingMessage, res: http.ServerResponse, content: Buffer, headers: http.OutgoingHttpHeaders) => {
+  const responseHeaders = { ...headers, 'Vary': 'Accept-Encoding' }
+  const send = (body: Buffer, compressed: boolean) => {
+    if (res.destroyed) return
+    res.writeHead(200, {
+      ...responseHeaders,
+      ...(compressed ? { 'Content-Encoding': 'gzip' } : {}),
+      'Content-Length': body.length,
+    })
+    res.end(body)
+  }
+  if (content.length < 1024 || !acceptsGzip(req)) return send(content, false)
+  gzip(content, { level: 4 }, (err, compressed) => {
+    if (err || compressed.length >= content.length) return send(content, false)
+    send(compressed, true)
+  })
+}
+
 const serveStatic = (req: IncomingMessage, res: http.ServerResponse, filePath: string) => {
   // Prevent path traversal: ensure the resolved file path stays within staticPath
   if (!isPathInside(filePath, global.lx.staticPath)) {
@@ -1055,6 +1128,7 @@ const serveStatic = (req: IncomingMessage, res: http.ServerResponse, filePath: s
     return
   }
   const contentType = getMime(filePath)
+  const compressible = /^(?:text\/|application\/(?:javascript|json)|image\/svg\+xml)/.test(contentType)
 
   try {
     const stats = fs.statSync(filePath)
@@ -1064,7 +1138,7 @@ const serveStatic = (req: IncomingMessage, res: http.ServerResponse, filePath: s
 
     // Check Cache Validity (Conditional Requests)
     if (req.headers['if-none-match'] === etag || req.headers['if-modified-since'] === lastModified) {
-      res.writeHead(304)
+      res.writeHead(304, { 'ETag': etag, 'Last-Modified': lastModified, ...(compressible ? { 'Vary': 'Accept-Encoding' } : {}) })
       res.end()
       return
     }
@@ -1079,15 +1153,19 @@ const serveStatic = (req: IncomingMessage, res: http.ServerResponse, filePath: s
           res.end('Server Error')
         }
       } else {
-        res.writeHead(200, {
+        const headers = {
           'Content-Type': contentType,
           'ETag': etag,
           'Last-Modified': lastModified,
           'Cache-Control': 'no-cache, must-revalidate', // Force browser to revalidate every time
           'Pragma': 'no-cache',
           'Expires': '0',
-        })
-        res.end(content, 'utf-8')
+        }
+        if (compressible) sendCompressible(req, res, content, headers)
+        else {
+          res.writeHead(200, headers)
+          res.end(content)
+        }
       }
     })
   } catch (err: any) {
@@ -4637,19 +4715,70 @@ const handleStartServer = async (port = 9527, ip = '0.0.0.0') => await new Promi
         }
         const userCfg = getUserConfig(verified)
         void customMusicManager.getCustomMusicList(verified).then(list => {
-          res.writeHead(200, {
-            'Content-Type': 'application/json',
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-          })
-          res.end(JSON.stringify({
+          const body = Buffer.from(JSON.stringify({
             success: true,
             data: list,
             allowOperateCustomMusicDir: !!userCfg?.allowOperateCustomMusicDir,
             allowWriteCustomMusicDir: !!userCfg?.allowWriteCustomMusicDir
           }))
+          sendCompressible(req, res, body, {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+          })
         }).catch(err => {
           res.writeHead(500, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({ success: false, message: err.message }))
+        })
+        return
+      }
+
+      // 自动补全自定义目录歌词/封面：后台任务，浏览器断开后仍继续。
+      if (/^\/api\/music\/custom\/(?:lyrics|covers)\/(?:batch|cancel)$/.test(pathname)) {
+        const assetManager = pathname.includes('/covers/') ? customCoversManager : customLyricsManager
+        const assetLabel = pathname.includes('/covers/') ? '封面' : '歌词'
+        const username = verifyUserAuth(req)
+        if (!username) {
+          res.writeHead(401, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ success: false, message: 'Unauthorized' }))
+          return
+        }
+        if (!global.lx.config['user.enableCustomMusicDir'] || !customMusicManager.getCustomMusicDir(username)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ success: false, message: '自定义音乐目录未启用' }))
+          return
+        }
+        if (req.method === 'GET' && pathname.endsWith('/batch')) {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+          res.end(JSON.stringify({ success: true, job: assetManager.get(username) }))
+          return
+        }
+        if (req.method !== 'POST') {
+          res.writeHead(405)
+          res.end('Method Not Allowed')
+          return
+        }
+        if (!getUserConfig(username)?.allowWriteCustomMusicDir) {
+          res.writeHead(403, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ success: false, message: `管理员未允许写入自定义目录中的${assetLabel}文件` }))
+          return
+        }
+        void readBody(req).then(body => {
+          try {
+            const data = JSON.parse(body || '{}')
+            if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('无效的任务请求')
+            if (pathname.endsWith('/cancel')) {
+              const cancelled = assetManager.cancel(username, data.id)
+              res.writeHead(cancelled ? 200 : 404, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ success: cancelled, job: assetManager.get(username) }))
+            } else {
+              const job = assetManager.start(username, data.filenames)
+              res.writeHead(202, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ success: true, job }))
+            }
+          } catch (error: any) {
+            res.writeHead(400, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ success: false, message: error.message || `无法启动${assetLabel}补全任务` }))
+          }
         })
         return
       }
@@ -4862,23 +4991,9 @@ const handleStartServer = async (port = 9527, ip = '0.0.0.0') => await new Promi
           return
         }
         try {
-          const customDir = customMusicManager.getCustomMusicDir(verified)
-          if (!customDir) throw new Error('未配置自定义目录')
-          const filePath = path.resolve(customDir, filename)
-          // 安全检查：防止路径穿越
-          if (!filePath.startsWith(path.resolve(customDir))) throw new Error('非法路径')
-          if (!fs.existsSync(filePath)) {
-            res.writeHead(404, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify({ success: false, message: '文件不存在' }))
-            return
-          }
-          const { MusicTagger: MT } = require('music-tag-native')
-          const tagger = new MT()
-          tagger.loadPath(filePath)
-          const lrc = tagger.lyrics || ''
-          tagger.dispose()
+          const lyrics = customMusicManager.getCustomLocalLyrics(filename, verified)
           res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ success: true, lrc }))
+          res.end(JSON.stringify({ success: true, ...lyrics }))
         } catch (e: any) {
           res.writeHead(200, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({ success: false, message: e.message || '读取内嵌歌词失败' }))

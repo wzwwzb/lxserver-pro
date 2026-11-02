@@ -1,3 +1,4 @@
+// Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 /**
  * Song List Manager for LX Music Web
  * Handles fetching, rendering and interactions for the "Song List" (Playlist) feature.
@@ -283,10 +284,24 @@ window.SongListManager = (function () {
 
         try {
             const url = `${API_BASE}/songList/detail?source=${source}&id=${encodeURIComponent(id)}&page=${page}`;
-            const res = await fetch(url);
-            const data = await res.json();
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 30000);
+            let res, data;
+            try {
+                res = await fetch(url, { signal: controller.signal });
+                try {
+                    data = await res.json();
+                } catch (error) {
+                    if (error.name === 'AbortError') throw error;
+                    data = null;
+                }
+            } finally {
+                clearTimeout(timeout);
+            }
+            if (!res.ok) throw new Error(data?.error || `请求失败 (${res.status})`);
+            if (!Array.isArray(data?.list)) throw new Error('歌单服务没有返回有效的歌曲列表');
 
-            detailState.info = data.info;
+            detailState.info = data.info || { name: '歌单' };
 
             // Normalize IDs to ensure batch operations work correctly
             const normalizedList = (data.list || []).map((song, idx) => {
@@ -320,7 +335,19 @@ window.SongListManager = (function () {
         } catch (e) {
             console.error('[SongList] Load detail failed:', e);
             if (page === 1) {
-                listContainer.innerHTML = `<div class="text-center text-red-500 p-10">加载失败: ${e.message}</div>`;
+                const message = e.name === 'AbortError' ? '请求超时，请稍后再试' : (e.message || '请稍后再试');
+                const errorEl = document.createElement('div');
+                errorEl.className = 'text-center text-red-500 p-10';
+                errorEl.textContent = `加载失败：${message}`;
+                listContainer.replaceChildren(errorEl);
+                for (const id of ['sl-detail-name', 'sl-detail-title']) {
+                    const el = document.getElementById(id);
+                    if (el) el.textContent = '加载失败';
+                }
+                const subtitle = document.getElementById('sl-detail-subtitle');
+                if (subtitle) subtitle.textContent = message;
+                const description = document.getElementById('sl-detail-desc');
+                if (description) description.textContent = '';
             }
         }
     }
@@ -552,6 +579,11 @@ window.SongListManager = (function () {
         const statsHtml = [];
         const totalSongs = detailState.total || info.total || detailState.list.length;
         statsHtml.push(`<span class="px-2 py-0.5 rounded-md bg-gray-500/10 border t-border-main"><i class="fas fa-music text-[10px] mr-1 text-emerald-500"></i>${totalSongs} 首歌曲</span>`);
+
+        const unavailableCount = Number(info.unavailableCount);
+        if (Number.isSafeInteger(unavailableCount) && unavailableCount > 0) {
+            statsHtml.push(`<span class="px-2 py-0.5 rounded-md bg-amber-500/10 border t-border-main">另有 ${unavailableCount} 首未返回</span>`);
+        }
 
         if (info.play_count || info.playCount) {
             statsHtml.push(`<span class="px-2 py-0.5 rounded-md bg-gray-500/10 border t-border-main"><i class="fas fa-headphones text-[10px] mr-1 text-emerald-500"></i>${info.play_count || formatPlayCount(info.playCount)}</span>`);

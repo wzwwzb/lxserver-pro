@@ -1,8 +1,22 @@
+<!-- Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md. -->
+
 # Subsonic 协议支持状态对照
 
 > 范围：`src/server/subsonic.ts` 对 Subsonic REST API 的**自定义实现**对照表。
 > 图例：✅ 已实现可用　🟡 占位（返回空 / no-op，兼容客户端握手）　❌ 未实现（返回 `Method not found`）
 > 更新：2026-09-19（协议补全：专辑信息 / 播放上报 / 书签 / 播放队列 / 相似歌曲 / 转码，见第四节）
+
+### 自定义目录接入（2026-10-21）
+
+Subsonic 现在复用用户自定义音乐目录的 `custom_index.json`。在后台开启全局「自定义歌曲目录」，再为用户启用并指定容器内目录（例如 `/library`），第三方客户端即可浏览其中的歌曲、歌手和专辑，无需导入 LX 歌单或配置在线音源。
+
+- `getPlaylists` 提供名为「本地音乐」的只读目录歌单；支持目录浏览、专辑和歌手详情、本地搜索、随机播放。
+- `stream` / `download` 直接读取原始音频，支持 HTTP Range、HEAD 和下载文件名；当前这条本地目录播放路径不进行服务端转码，客户端应选择原始音质。
+- 封面优先读取内嵌图片，其次读取歌曲同名的外置图片，缺失时显示默认图；歌词优先读取同名 `.lrc`，再读取内嵌歌词。网页自定义目录提供后台自动补全歌词和封面，保留原始音频与标签，Feishin 可通过现有接口读取新增文件。
+- `startScan` 同步更新当前用户目录索引，`getScanStatus` 返回索引歌曲数量；扫描期间请求等待完成。
+- 歌曲 ID 按用户和相对路径生成。读取时重新检查用户目录权限与真实文件路径；本地曲目不写入共享的在线歌曲缓存。
+
+听澜盒等客户端选择 **Subsonic** 类型，填写服务根地址与普通用户账号密码。地址不附加 `/user1` 或 `/rest`。更新服务端代码后，需要重建 Docker 镜像，并在客户端刷新音乐库。
 
 ---
 
@@ -12,8 +26,8 @@
 |---|---|---|---|
 | `ping` | 系统 | ✅ | 握手 / 存活检测 |
 | `getLicense` | 系统 | ✅ | 许可信息 |
-| `getScanStatus` | 系统 | 🟡 | 固定返回 `scanning:false` |
-| `getMusicFolders` | 浏览 | ✅ | 单一音乐库 |
+| `getScanStatus` / `startScan` | 系统 | ✅ | 自定义目录索引数量 / 同步扫描 |
+| `getMusicFolders` | 浏览 | ✅ | 本地音乐库及在线音源入口 |
 | `getMusicDirectory` | 浏览 | ✅ | 专辑 / 歌单 / 歌手目录 |
 | `getGenres` | 浏览 | ✅ | 流派（来自 QQ 音乐 discovery） |
 | `getArtists` | 浏览 | ✅ | 按字母索引的歌手 |
@@ -23,7 +37,7 @@
 | `getAlbumList` / `getAlbumList2` | 浏览 | ✅ | 含 `recommend`/`random`/`newest`/`recent` 推荐专辑逻辑 |
 | `getStarred` / `getStarred2` | 浏览 | ✅ | 收藏 |
 | `getSong` | 媒体 | ✅ | 单曲信息 |
-| `stream` / `download` | 媒体 | ✅ | 在线音频流（按 `source_songmid` 解析） |
+| `stream` / `download` | 媒体 | ✅ | 在线音频流及用户自定义目录文件 |
 | `getCoverArt` | 媒体 | ✅ | 封面代理 |
 | `getUser` | 用户 | ✅ | 当前用户 |
 | `search` / `search2` / `search3` | 搜索 | ✅ | 本地 + 在线全网搜索 |

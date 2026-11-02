@@ -1,3 +1,4 @@
+// Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 /**
  * CustomDirManager (用户自定义音乐目录管理器)
  * 独立于本地音乐的 cache/music 目录，专门读取和呈现用户自定义目录 (customMusicDir) 下的 custom_index.json
@@ -21,6 +22,14 @@ window.CustomDirManager = {
     listEventsBound: false,
     coverRenderTimer: null,
     enableReMapping: false,
+    lyricJob: null,
+    lyricPollTimer: null,
+    lyricPollBusy: false,
+    lyricJobUser: '',
+    coverJob: null,
+    coverPollTimer: null,
+    coverPollBusy: false,
+    coverJobUser: '',
 
     // 目录树筛选状态
     dirFilterAll: true,
@@ -384,6 +393,10 @@ window.CustomDirManager = {
             const btn = document.querySelector(`button[onclick*="${action}"]`);
             if (btn) btn.style.display = canWrite ? '' : 'none';
         });
+        this.renderLyricJob();
+        this.renderCoverJob();
+        const coverBatch = document.getElementById('cd-batch-cover');
+        if (coverBatch) coverBatch.classList.toggle('hidden', !this.isActive || !canWrite);
     },
 
     getSelectedEntries() {
@@ -543,6 +556,8 @@ window.CustomDirManager = {
                 this.originalData = result.data || [];
                 this.originalData.sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
                 this.applyFilters();
+                this.loadLyricJob();
+                this.loadCoverJob();
             } else {
                 throw new Error(result.message || '加载自定义目录失败');
             }
@@ -843,7 +858,7 @@ window.CustomDirManager = {
             const missingLyric = !item.hasLyric && !item.lyricFilename;
             const metadataUnsupported = item.metadataWritable === false;
 
-            const coverStatusTitle = item.coverType === 'embedded' ? '封面已嵌入音频标签' : (item.hasCover ? '已有封面' : '缺封面');
+            const coverStatusTitle = item.coverType === 'embedded' ? '封面已嵌入音频标签' : item.coverType === 'sidecar' ? '同名外置封面图片' : (item.hasCover ? '已有封面' : '缺封面');
             const lyricStatusBadge = item.hasEmbedLyric
                 ? '<span class="text-[10px] text-emerald-500 border border-gray-400/40 dark:border-gray-600/50 rounded px-1 scale-90 hidden sm:inline-block" title="已嵌入歌词标签">词</span>'
                 : (item.hasLyric ? '<span class="text-[10px] text-amber-500 border border-amber-400/40 rounded px-1 scale-90 hidden sm:inline-block" title="外置歌词文件">外置词</span>' : '');
@@ -856,7 +871,7 @@ window.CustomDirManager = {
                                 <i class="fas fa-music t-text-muted text-xs"></i>
                              </div>`;
             if (item.hasCover) {
-                const coverVersion = [Math.round(item.mtime || 0), item.size || 0].join('-');
+                const coverVersion = [Math.round(item.mtime || 0), item.size || 0, Math.round(item.coverMtime || 0)].join('-');
                 const coverUrl = `/api/music/custom/cover?filename=${encodeURIComponent(item.filename)}&user=${encodeURIComponent(username)}${authToken ? `&token=${encodeURIComponent(authToken)}` : ''}&v=${encodeURIComponent(coverVersion)}`;
                 coverHtml = `<img data-src="${this.escapeAttr(coverUrl)}" data-lm-cover-index="${index}" src="/music/assets/logo.svg" loading="lazy" fetchpriority="low" class="lazy-image lm-cover-image is-placeholder w-10 h-10 md:w-12 md:h-12 rounded-lg object-cover shadow-sm flex-shrink-0 border t-border-main mr-2.5 md:mr-4 ml-0.5 md:ml-3">`;
             }
@@ -1351,61 +1366,195 @@ window.CustomDirManager = {
         window.openPlaylistAddModal(collectableTargets);
     },
 
-    // 批量补全歌词
+    // 所选歌曲自动匹配并在服务器后台补全歌词。
     async batchFetchLyrics() {
-        const targets = this.getSelectedEntries().filter(item => !item.hasLyric);
-        if (targets.length === 0) {
-            if (typeof showInfo === 'function') showInfo('选中的自定义目录歌曲中没有需要补充歌词的项');
+        const filenames = this.getSelectedFilenames();
+        if (!filenames.length) {
+            if (typeof showInfo === 'function') showInfo('请先选择要补全歌词的歌曲');
             return;
         }
+        await this.startLyricJob(filenames);
+    },
 
-        if (typeof showSelect === 'function') {
-            if (!(await showSelect('补全歌词', `选中的文件中有 ${targets.length} 首没有对应歌词，确定要向服务器请求补全吗?`))) return;
+    async startLyricJob(filenames = null) {
+        try {
+            const res = await fetch('/api/music/custom/lyrics/batch', {
+                method: 'POST', headers: { ...this.getAuthHeaders(), 'Content-Type': 'application/json' },
+                body: JSON.stringify(filenames ? { filenames } : {})
+            });
+            const result = await res.json();
+            if (!res.ok || !result.success) throw new Error(result.message || '无法开始补全歌词');
+            this.lyricJob = result.job;
+            this.lyricJobUser = this.getCurrentUsername();
+            this.renderLyricJob();
+            this.loadLyricJob();
+            if (typeof showInfo === 'function') showInfo('已开始后台补全歌词，已有歌词及无法匹配的歌曲会自动跳过');
+        } catch (error) {
+            if (typeof showError === 'function') showError(error.message || '补全歌词失败');
         }
+    },
 
-        let success = 0;
-        let fail = 0;
-
-        for (const item of targets) {
-            const songData = {
-                ...(item.songInfo || {}),
-                id: item.id,
-                songmid: item.songmid,
-                source: item.source,
-                name: item.name,
-                singer: item.singer,
-                album: item.album,
-                interval: item.interval,
-                filename: item.filename,
-                folder: 'custom'
-            };
-
-            if (!songData.source || songData.source === 'unknown' || songData.source === 'local' || songData.source === 'custom') {
-                fail++;
-                continue;
+    async loadLyricJob() {
+        if (!this.isActive || this.lyricPollBusy) return;
+        const username = this.getCurrentUsername();
+        this.lyricPollBusy = true;
+        try {
+            const res = await fetch('/api/music/custom/lyrics/batch', { headers: this.getAuthHeaders(), cache: 'no-store' });
+            if (!res.ok) return;
+            const result = await res.json();
+            if (!result.success || username !== this.getCurrentUsername()) return;
+            const previous = this.lyricJob;
+            this.lyricJob = result.job;
+            this.lyricJobUser = username;
+            this.renderLyricJob();
+            const running = result.job && ['running', 'cancelling'].includes(result.job.status);
+            if (running && !this.lyricPollTimer) {
+                this.lyricPollTimer = setInterval(() => this.loadLyricJob(), 2000);
+            } else if (!running && this.lyricPollTimer) {
+                clearInterval(this.lyricPollTimer);
+                this.lyricPollTimer = null;
             }
-
-            try {
-                if (typeof window.requestServerLyricCache === 'function') {
-                    const synced = await window.requestServerLyricCache(songData, item.quality, true);
-                    if (!synced) {
-                        fail++;
-                        continue;
-                    }
-                    success++;
-                    if (typeof showInfo === 'function') showInfo(`[${success}/${targets.length}] 成功补全: ${item.name}`);
-                } else {
-                    fail++;
-                }
-            } catch (e) {
-                fail++;
+            if (previous && ['running', 'cancelling'].includes(previous.status) && result.job && !running) {
+                if (typeof showInfo === 'function') showInfo(`歌词补全结束：下载 ${result.job.downloaded} 首，跳过 ${result.job.skipped} 首，失败 ${result.job.failed} 首`);
+                await this.fetchData(true);
             }
+        } catch (error) {
+            console.warn('[CustomLyrics] 获取任务进度失败:', error.message);
+        } finally {
+            this.lyricPollBusy = false;
         }
+    },
 
-        if (typeof showInfo === 'function') {
-            showInfo(`补全操作完成。成功 ${success} 项，失败/未关联 ${fail} 项`);
+    renderLyricJob() {
+        const panel = document.getElementById('cd-lyric-panel');
+        if (!panel) return;
+        panel.classList.toggle('hidden', !this.isActive);
+        const job = this.lyricJobUser === this.getCurrentUsername() ? this.lyricJob : null;
+        const running = job && ['running', 'cancelling'].includes(job.status);
+        const start = document.getElementById('cd-lyric-start');
+        const cancel = document.getElementById('cd-lyric-cancel');
+        const summary = document.getElementById('cd-lyric-summary');
+        const current = document.getElementById('cd-lyric-current');
+        if (start) { start.disabled = !!running || !window.userAllowWriteCustomDir; start.textContent = running ? '正在补全歌词' : '自动补全整库歌词'; }
+        if (cancel) { cancel.classList.toggle('hidden', !running); cancel.disabled = job?.status === 'cancelling'; }
+        if (summary) summary.textContent = job
+            ? `已处理 ${job.processed}/${job.total} 首 · 下载 ${job.downloaded} · 跳过 ${job.skipped} · 失败 ${job.failed}`
+            : '自动匹配歌曲并补全缺失歌词';
+        if (current) current.textContent = job?.message || (running ? `${job.status === 'cancelling' ? '正在停止' : '正在处理'}：${job.current || '准备中'}`
+            : job ? ({ completed: '补全已完成', cancelled: '任务已停止', interrupted: '任务中断，可重新补全', failed: '任务失败，请查看服务器状态' }[job.status] || '')
+            : window.userAllowWriteCustomDir ? '已有歌词、纯音乐及无法可靠匹配的歌曲会自动跳过' : '请在管理后台允许此用户写入歌曲文件后使用');
+        if (!this.isActive && this.lyricPollTimer) { clearInterval(this.lyricPollTimer); this.lyricPollTimer = null; }
+    },
+
+    async cancelLyricJob() {
+        if (!this.lyricJob) return;
+        try {
+            const res = await fetch('/api/music/custom/lyrics/cancel', {
+                method: 'POST', headers: { ...this.getAuthHeaders(), 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: this.lyricJob.id })
+            });
+            const result = await res.json();
+            if (!res.ok || !result.success) throw new Error('无法停止歌词任务');
+            this.lyricJob = result.job;
+            this.renderLyricJob();
+        } catch (error) { if (typeof showError === 'function') showError(error.message); }
+    },
+
+    async batchFetchCovers() {
+        const filenames = this.getSelectedFilenames();
+        if (!filenames.length) {
+            if (typeof showInfo === 'function') showInfo('请先选择要补全封面的歌曲');
+            return;
         }
-        await this.refresh();
+        await this.startCoverJob(filenames);
+    },
+
+    async startCoverJob(filenames = null) {
+        const username = this.getCurrentUsername();
+        try {
+            const res = await fetch('/api/music/custom/covers/batch', {
+                method: 'POST', headers: { ...this.getAuthHeaders(), 'Content-Type': 'application/json' },
+                body: JSON.stringify(filenames ? { filenames } : {})
+            });
+            const result = await res.json();
+            if (!res.ok || !result.success) throw new Error(result.message || '无法开始补全封面');
+            if (username !== this.getCurrentUsername()) return;
+            this.coverJob = result.job;
+            this.coverJobUser = username;
+            this.renderCoverJob();
+            this.loadCoverJob();
+            if (typeof showInfo === 'function') showInfo('已开始后台补全封面，已有封面及无法可靠匹配的歌曲会自动跳过');
+        } catch (error) {
+            if (typeof showError === 'function') showError(error.message || '补全封面失败');
+        }
+    },
+
+    async loadCoverJob() {
+        if (!this.isActive || this.coverPollBusy) return;
+        const username = this.getCurrentUsername();
+        this.coverPollBusy = true;
+        try {
+            const res = await fetch('/api/music/custom/covers/batch', { headers: this.getAuthHeaders(), cache: 'no-store' });
+            if (!res.ok) {
+                clearInterval(this.coverPollTimer); this.coverPollTimer = null;
+                return;
+            }
+            const result = await res.json();
+            if (!result.success || username !== this.getCurrentUsername()) return;
+            const previous = this.coverJobUser === username ? this.coverJob : null;
+            this.coverJob = result.job;
+            this.coverJobUser = username;
+            this.renderCoverJob();
+            const running = result.job && ['running', 'cancelling'].includes(result.job.status);
+            if (running && this.isActive && !this.coverPollTimer) {
+                this.coverPollTimer = setInterval(() => this.loadCoverJob(), 2000);
+            } else if (!running && this.coverPollTimer) {
+                clearInterval(this.coverPollTimer); this.coverPollTimer = null;
+            }
+            if (previous && ['running', 'cancelling'].includes(previous.status) && result.job && !running) {
+                if (typeof showInfo === 'function') showInfo(`封面补全结束：下载 ${result.job.downloaded} 首，跳过 ${result.job.skipped} 首，失败 ${result.job.failed} 首`);
+                await this.fetchData(true);
+            }
+        } catch (error) {
+            console.warn('[CustomCovers] 获取任务进度失败:', error.message);
+        } finally { this.coverPollBusy = false; }
+    },
+
+    renderCoverJob() {
+        const panel = document.getElementById('cd-cover-panel');
+        if (!panel) return;
+        panel.classList.toggle('hidden', !this.isActive);
+        const job = this.coverJobUser === this.getCurrentUsername() ? this.coverJob : null;
+        const running = job && ['running', 'cancelling'].includes(job.status);
+        const start = document.getElementById('cd-cover-start');
+        const cancel = document.getElementById('cd-cover-cancel');
+        const summary = document.getElementById('cd-cover-summary');
+        const current = document.getElementById('cd-cover-current');
+        if (start) { start.disabled = !!running || !window.userAllowWriteCustomDir; start.textContent = running ? '正在补全封面' : '自动补全整库封面'; }
+        if (cancel) { cancel.classList.toggle('hidden', !running); cancel.disabled = job?.status === 'cancelling'; }
+        if (summary) summary.textContent = job
+            ? `已处理 ${job.processed}/${job.total} 首 · 下载 ${job.downloaded} · 跳过 ${job.skipped} · 失败 ${job.failed}`
+            : '自动匹配歌曲并补全缺失封面';
+        if (current) current.textContent = job?.message || (running ? `${job.status === 'cancelling' ? '正在停止' : '正在处理'}：${job.current || '准备中'}`
+            : job ? ({ completed: '补全已完成', cancelled: '任务已停止', interrupted: '任务中断，可重新补全', failed: '任务失败，请查看服务器状态' }[job.status] || '')
+            : window.userAllowWriteCustomDir ? '保存同名图片；已有封面及无法可靠匹配的歌曲会自动跳过，纯音乐也可匹配' : '请在管理后台允许此用户写入歌曲文件后使用');
+        if (!this.isActive && this.coverPollTimer) { clearInterval(this.coverPollTimer); this.coverPollTimer = null; }
+    },
+
+    async cancelCoverJob() {
+        const username = this.getCurrentUsername();
+        if (!this.coverJob || this.coverJobUser !== username) return;
+        try {
+            const res = await fetch('/api/music/custom/covers/cancel', {
+                method: 'POST', headers: { ...this.getAuthHeaders(), 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: this.coverJob.id })
+            });
+            const result = await res.json();
+            if (!res.ok || !result.success) throw new Error('无法停止封面任务');
+            if (username !== this.getCurrentUsername()) return;
+            this.coverJob = result.job;
+            this.renderCoverJob();
+        } catch (error) { if (typeof showError === 'function') showError(error.message); }
     },
 
     // 批量嵌入歌词到音频文件 USLT 标签

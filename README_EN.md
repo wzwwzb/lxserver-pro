@@ -1,4 +1,10 @@
+<!-- Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md. -->
+
 # LX Music Sync Server (Enhanced Edition)
+
+> This repository is an independently maintained, unofficial fork of [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver). We thank the upstream authors and contributors, including the [LX Music](https://github.com/lyswhut) community.
+>
+> This fork adds local-library and Subsonic integration, lyric and cover matching, music-tag encoding fixes, playlist compatibility, and deployment improvements. The upstream license notices and supplementary terms are retained. Upstream releases and images linked below do not include these fork changes; see the [Chinese README](README.md) and [third-party notices](THIRD_PARTY_NOTICES.md) for details.
 
 ![lxserver](https://socialify.git.ci/XCQ0607/lxserver/image?description=1&forks=0&issues=0&logo=https://raw.githubusercontent.com/XCQ0607/lxserver/refs/heads/main/public/icon.svg&owner=1&pulls=0&stargazers=0&theme=Auto)
 

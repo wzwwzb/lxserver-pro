@@ -1,3 +1,4 @@
+// Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 import { VM } from 'vm2'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -6,11 +7,13 @@ import needle from 'needle'
 import * as crypto from 'crypto'
 import * as zlib from 'zlib'
 import { promisify } from 'util'
+import { AsyncLocalStorage } from 'node:async_hooks'
 
 import * as tunnel from 'tunnel'
 import { getProxyAgent } from '../modules/utils/proxy.js'
 const inflate = promisify(zlib.inflate)
 const deflate = promisify(zlib.deflate)
+const requestContext = new AsyncLocalStorage<{ response?: { host: string, status: number } }>()
 
 // 彻底切断与沙箱上下文的联系
 function decontextify(obj: any): any {
@@ -145,6 +148,7 @@ async function createLxRequest(isUnsafe: boolean = false, onSniffUpdate?: (alert
     const agentHttp = agentHttps ? await getProxyAgent('http://lx-proxy-probe.invalid', 'customSource') : undefined
 
     return (url: string, options: any, callback: Function) => {
+        const context = requestContext.getStore()
         const safeOptions = decontextify(options || {})
         const { method = 'get', timeout, headers, body, form, formData } = safeOptions
 
@@ -171,12 +175,14 @@ async function createLxRequest(isUnsafe: boolean = false, onSniffUpdate?: (alert
                 if (err) {
                     callback.call(null, decontextify(err), null, null)
                 } else {
-                    let parsedBody = body
-                    if (typeof body === 'string') {
-                        try {
-                            parsedBody = JSON.parse(body)
-                        } catch { }
-                    }
+                    if (context) context.response = { host: new URL(url).hostname, status: resp.statusCode }
+                    // LX parses the raw response regardless of Content-Type. Some APIs send
+                    // JSON as octet-stream, which needle otherwise exposes as a Buffer.
+                    const raw = Buffer.isBuffer(resp.raw) ? Buffer.from(resp.raw)
+                        : Buffer.isBuffer(body) ? Buffer.from(body)
+                            : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body ?? ''))
+                    let parsedBody: any = raw.toString('utf8')
+                    try { parsedBody = JSON.parse(parsedBody) } catch { }
 
                     // 自动嗅探第三方脚本通过 HTTP 响应返回的更新提醒 (例如独家音源、各大更新接口)
                     if (onSniffUpdate && parsedBody && typeof parsedBody === 'object') {
@@ -195,6 +201,8 @@ async function createLxRequest(isUnsafe: boolean = false, onSniffUpdate?: (alert
                         statusCode: resp.statusCode,
                         statusMessage: resp.statusMessage,
                         headers: resp.headers,
+                        bytes: resp.bytes ?? raw.length,
+                        raw,
                         body: decontextify(parsedBody)
                     }
 
@@ -207,8 +215,10 @@ async function createLxRequest(isUnsafe: boolean = false, onSniffUpdate?: (alert
                         safeResp = JSON.parse(JSON.stringify({
                             statusCode: resp.statusCode,
                             statusMessage: resp.statusMessage,
-                            headers: resp.headers
+                            headers: resp.headers,
+                            bytes: resp.bytes ?? raw.length
                         }));
+                        safeResp.raw = raw;
                         safeResp.body = jsonBody;
                     }
 
@@ -268,7 +278,7 @@ export async function loadUserApi(apiInfo: UserApiInfo): Promise<any> {
     // 构建 lx 工具集
     const lxUtils = {
         buffer: {
-            from: (d: any, e: any) => Buffer.from(decontextify(d), decontextify(e)),
+            from: (d: any, e: any, length?: number) => Buffer.from(decontextify(d), decontextify(e), length),
             bufToString: (b: any, f: any) => Buffer.isBuffer(b) ? b.toString(f) : Buffer.from(b, 'binary').toString(f)
         },
         crypto: {
@@ -277,11 +287,17 @@ export async function loadUserApi(apiInfo: UserApiInfo): Promise<any> {
                 const dKey = decontextify(key)
                 const dIv = decontextify(iv)
                 const dBuffer = decontextify(buffer)
-                const algorithm = `aes-${(dKey as any).length * 8}-${mode}`
+                // LX passes the complete cipher name, e.g. aes-128-cbc. Retain
+                // shorthand modes for scripts written for earlier server versions.
+                const algorithm = /^aes-/i.test(mode) ? mode : `aes-${Buffer.byteLength(dKey) * 8}-${mode}`
                 const cipher = crypto.createCipheriv(algorithm as any, dKey as any, dIv as any)
                 return Buffer.concat([cipher.update(dBuffer as any) as any, cipher.final() as any])
             },
-            rsaEncrypt: (buffer: any, key: any) => crypto.publicEncrypt(decontextify(key) as any, decontextify(buffer) as any),
+            rsaEncrypt: (buffer: any, key: any) => {
+                const data = Buffer.from(decontextify(buffer))
+                const padded = Buffer.concat([Buffer.alloc(128 - data.length), data])
+                return crypto.publicEncrypt({ key: decontextify(key), padding: crypto.constants.RSA_NO_PADDING }, padded)
+            },
             randomBytes: (size: number) => crypto.randomBytes(size),
         },
         zlib: {
@@ -337,12 +353,14 @@ export async function loadUserApi(apiInfo: UserApiInfo): Promise<any> {
                 error.updateAlert = alertPayload
                 if (initReject) initReject(error)
             }
+            return Promise.resolve()
         },
         on: (eventName: string, handler: Function) => {
             // console.log(`[UserApi-${fullApiInfo.name}] on:`, eventName)
             if (eventName === 'request') {
                 eventHandlers.set(eventName, handler)
             }
+            return Promise.resolve()
         }
     }
 
@@ -455,22 +473,30 @@ export async function loadUserApi(apiInfo: UserApiInfo): Promise<any> {
             info: { ...fullApiInfo, sources: registeredSources },
             handlers: eventHandlers,
             callRequest: async (action: string, source: string, info: any) => {
-                try {
-                    const handler = eventHandlers.get('request')
-                    if (!handler) throw new Error(`源 ${fullApiInfo.name} 未注册 request 处理器`)
+                const context: { response?: { host: string, status: number } } = {}
+                return requestContext.run(context, async () => {
+                    try {
+                        const handler = eventHandlers.get('request')
+                        if (!handler) throw new Error(`源 ${fullApiInfo.name} 未注册 request 处理器`)
 
-                    // 核心修复：如果是原生 VM 模式，将传入数据 JSON 化以纯净化原型链（确保它是 VM 内的对象）
-                    let inputData = { action, source, info }
-                    if (apiInfo.allowUnsafeVM && global.lx.config['system.allowUnsafeVM']) {
-                        inputData = JSON.parse(JSON.stringify(inputData))
+                        // 核心修复：如果是原生 VM 模式，将传入数据 JSON 化以纯净化原型链（确保它是 VM 内的对象）
+                        let inputData = { action, source, info }
+                        if (apiInfo.allowUnsafeVM && global.lx.config['system.allowUnsafeVM']) {
+                            inputData = JSON.parse(JSON.stringify(inputData))
+                        }
+
+                        const result = await handler(inputData)
+                        return decontextify(result)
+                    } catch (e: any) {
+                        const response = context.response
+                        // Report only the host and status: request URLs may contain keys.
+                        const error = response && response.status >= 400
+                            ? new Error(`${e?.message || String(e)} (上游 ${response.host} 返回 HTTP ${response.status})`)
+                            : e
+                        console.error(`[自定义源-${fullApiInfo.name}] 调用请求异常:`, error?.message || String(error))
+                        throw error
                     }
-
-                    const result = await handler(inputData)
-                    return decontextify(result)
-                } catch (e: any) {
-                    console.error(`[自定义源-${fullApiInfo.name}] 调用请求异常:`, e.message)
-                    throw e
-                }
+                })
             }
         }
 

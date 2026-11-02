@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+<!-- Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md. -->
 <html lang="zh-CN">
 
 <head>
@@ -1335,6 +1336,24 @@
                 <div id="view-localmusic"
                     class="absolute inset-0 flex flex-col px-2 pt-2 md:px-6 md:pt-6 pb-44 md:pb-32 hidden opacity-0 transition-all duration-300 overflow-hidden">
 
+                    <div id="cd-lyric-panel" class="hidden mb-2 p-3 rounded-xl border t-border-main t-bg-main shrink-0" role="status" aria-live="polite">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <button id="cd-lyric-start" onclick="window.CustomDirManager.startLyricJob()" class="px-3 py-1.5 rounded-lg bg-blue-500 hover:bg-blue-600 text-white text-xs font-bold disabled:opacity-50">自动补全整库歌词</button>
+                            <button id="cd-lyric-cancel" onclick="window.CustomDirManager.cancelLyricJob()" class="hidden px-3 py-1.5 rounded-lg t-bg-track t-text-main text-xs disabled:opacity-50">停止补词</button>
+                            <span id="cd-lyric-summary" class="text-xs t-text-main">自动匹配歌曲并补全缺失歌词</span>
+                        </div>
+                        <p id="cd-lyric-current" class="mt-1 text-xs t-text-muted break-words">已有歌词、纯音乐及无法可靠匹配的歌曲会自动跳过</p>
+                    </div>
+
+                    <div id="cd-cover-panel" class="hidden mb-2 p-3 rounded-xl border t-border-main t-bg-main shrink-0" role="status" aria-live="polite">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <button id="cd-cover-start" onclick="window.CustomDirManager.startCoverJob()" class="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold disabled:opacity-50">自动补全整库封面</button>
+                            <button id="cd-cover-cancel" onclick="window.CustomDirManager.cancelCoverJob()" class="hidden px-3 py-1.5 rounded-lg t-bg-track t-text-main text-xs disabled:opacity-50">停止补封面</button>
+                            <span id="cd-cover-summary" class="text-xs t-text-main">自动匹配歌曲并补全缺失封面</span>
+                        </div>
+                        <p id="cd-cover-current" class="mt-1 text-xs t-text-muted break-words">保存同名图片；已有封面及无法可靠匹配的歌曲会自动跳过，纯音乐也可匹配</p>
+                    </div>
+
                     <!-- Settings and Filters Area -->
                     <div
                         class="grid grid-cols-[auto_1fr] md:flex md:flex-row md:items-center justify-between gap-1.5 md:gap-3 mb-1.5 md:mb-2 shrink-0 px-1">
@@ -1670,6 +1689,10 @@
                                     <button onclick="window.LocalMusicManager.batchFetchLyrics()"
                                         class="text-[11px] md:text-xs px-2.5 py-1.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg shadow-sm transition-all font-medium whitespace-nowrap flex items-center gap-1.5">
                                         <i class="fas fa-closed-captioning"></i>补全歌词
+                                    </button>
+                                    <button id="cd-batch-cover" onclick="window.CustomDirManager.batchFetchCovers()"
+                                        class="hidden text-[11px] md:text-xs px-2.5 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg shadow-sm transition-all font-medium whitespace-nowrap flex items-center gap-1.5">
+                                        <i class="fas fa-image"></i>补全封面
                                     </button>
                                     <button onclick="window.LocalMusicManager.batchEmbedLyric()"
                                         class="text-[11px] md:text-xs px-2.5 py-1.5 bg-violet-500 hover:bg-violet-600 text-white rounded-lg shadow-sm transition-all font-medium whitespace-nowrap flex items-center gap-1.5"

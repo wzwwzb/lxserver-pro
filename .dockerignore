@@ -1,8 +1,16 @@
+# Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 .git
 .gitignore
 node_modules
 data
 logs
+.env
+.env.*
+!.env.example
+cache
+music
+cover_cache
+server
 lx-music-desktop-master
 dist-electron
 build

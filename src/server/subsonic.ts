@@ -1,9 +1,15 @@
+// Modified in wzwwzb/lxserver-pro from XCQ0607/lxserver; see README.md.
 import http from 'http'
 import crypto from 'crypto'
 import { URL } from 'url'
 import { getUserSpace, getUserDirname, getUserConfig } from '@/user'
 import { callUserApiGetMusicUrl } from '@/server/userApi'
 import { downloadAndCache, checkCache, serveCacheFile } from '@/server/fileCache'
+import {
+    CUSTOM_DIRECTORY_PLAYLIST_ID, customDirectoryQuality, findCustomDirectoryMusic,
+    getCustomDirectoryCover, getCustomDirectoryLyrics, getCustomDirectoryMusic,
+    isCustomDirectoryId, refreshCustomDirectoryMusic, serveCustomDirectoryMusic, type CustomDirectoryMusic,
+} from './subsonicCustomMusic'
 import {
     getSingerPic, getSingerDetail, getSingerMid, nameSimilarity,
     resolveSingerSources, getOrderedSingerSources, normalizeName as normalizeSingerName,
@@ -858,7 +864,7 @@ class SubsonicHandler {
     }
 
     private cacheOnlineSong(music: LX.Music.MusicInfo) {
-        if (!music || !music.id) return
+        if (!music || !music.id || music.source === 'local') return
         this.loadOnlineSongCache()
         if (this.onlineSongCache.size > 5000) {
             const firstKey = this.onlineSongCache.keys().next().value
@@ -1311,12 +1317,14 @@ class SubsonicHandler {
                     return this.handleGetIndexes(res, username, format)
 
                 case 'startScan':
-                // [新增] 本服曲库是在线聚合、无常驻扫描任务，返回 ok 只是为了不让客户端
-                // 因 "Method not found" 报错；真实状态由 getScanStatus 统一返回（恒为未扫描）。
-                case 'getScanStatus':
+                case 'getScanStatus': {
+                    const music = method === 'startScan'
+                        ? await refreshCustomDirectoryMusic(username)
+                        : await getCustomDirectoryMusic(username)
                     return this.sendResponse(res, format === 'json'
-                        ? { scanStatus: { scanning: false, count: 0 } }
-                        : { scanStatus: { attrs: { scanning: false, count: 0 } } }, format)
+                        ? { scanStatus: { scanning: false, count: music.length } }
+                        : { scanStatus: { attrs: { scanning: false, count: music.length } } }, format)
+                }
 
                 default:
                     if (global.lx.config['subsonic.enableDebug']) {
@@ -1333,6 +1341,23 @@ class SubsonicHandler {
     // ─────────────────────────────────────────────
     // 帮助函数
     // ─────────────────────────────────────────────
+
+    /** Expose the directory as a read-only virtual playlist without rewriting LX lists. */
+    private async getSubsonicListData(username: string) {
+        const data = await getUserSpace(username).listManage.getListData()
+        const music = await getCustomDirectoryMusic(username)
+        if (!music.length) return data
+        return {
+            ...data,
+            userList: [...data.userList, {
+                id: CUSTOM_DIRECTORY_PLAYLIST_ID,
+                name: '本地音乐',
+                position: -1,
+                locationUpdateTime: 0,
+                list: music,
+            } as (typeof data.userList)[number]],
+        }
+    }
 
     private async getLibraryData(username: string, type: 'artists' | 'albums'): Promise<any[]> {
         const userDir = path.join(global.lx.userPath, getUserDirname(username))
@@ -1458,7 +1483,7 @@ class SubsonicHandler {
             track: (music as any).track || 0,
             year: (music as any).year || 0,
             genre: genreMatch,
-            coverArt: (picUrl && typeof picUrl === 'string' && picUrl.startsWith('http')) ? picUrl : albumId,
+            coverArt: isCustomDirectoryId(id) ? id : (picUrl && typeof picUrl === 'string' && picUrl.startsWith('http')) ? picUrl : albumId,
             duration: this.parseDuration(music.interval),
             ...this.getBestQualityMeta(music),
             ...(starred ? { starred } : {}),
@@ -1474,6 +1499,7 @@ class SubsonicHandler {
      * 从歌曲元数据中检测并提取最佳音质配置
      */
     private getBestQualityMeta(music: LX.Music.MusicInfo) {
+        if (isCustomDirectoryId(music.id)) return customDirectoryQuality(music as CustomDirectoryMusic)
         const meta = (music as any).meta || {}
         const qualitys = (music as any).types || (music as any)._types || meta.qualitys || meta.types || meta._types || (music as any)._qualitys || meta._qualitys || []
 
@@ -1523,11 +1549,15 @@ class SubsonicHandler {
 
     /** 查找某个用户下所有列表中的某首歌 */
     private async findMusicById(username: string, id: string): Promise<{ music: LX.Music.MusicInfo, listId: string } | null> {
+        if (isCustomDirectoryId(id)) {
+            const music = await findCustomDirectoryMusic(username, id)
+            return music ? { music, listId: CUSTOM_DIRECTORY_PLAYLIST_ID } : null
+        }
         // [修复] 读取前确保磁盘上的 onlineSongCache 已加载（之前只在 cacheOnlineSong 写入时触发，
         // 导致重启后首次读取发生在任何写入之前，落盘数据永远读不进来 -> 重启即丢）
         this.loadOnlineSongCache()
         const userSpace = getUserSpace(username)
-        const listData = await userSpace.listManage.getListData()
+        const listData = await this.getSubsonicListData(username)
 
         let music = listData.loveList.find((m: any) => m.id === id)
         if (music) return { music, listId: 'love' }
@@ -1634,7 +1664,7 @@ class SubsonicHandler {
 
     private async handleGetPlaylists(res: http.ServerResponse, username: string, format: string) {
         const userSpace = getUserSpace(username)
-        const listData = await userSpace.listManage.getListData()
+        const listData = await this.getSubsonicListData(username)
         // subsonicLog.debug(`[Subsonic] handleGetPlaylists for ${username}: default=${listData.defaultList.length}, love=${listData.loveList.length}, userLists=${listData.userList.length}`)
 
         const buildPlaylist = (id: string, name: string, musics: any[], created?: string, coverArt?: string) => ({
@@ -1722,7 +1752,7 @@ class SubsonicHandler {
         }
 
         const userSpace = getUserSpace(username)
-        const listData = await userSpace.listManage.getListData()
+        const listData = await this.getSubsonicListData(username)
 
         let musics: LX.Music.MusicInfo[] = []
         let listName = 'Unknown'
@@ -1785,12 +1815,13 @@ class SubsonicHandler {
     private async handleUpdatePlaylist(res: http.ServerResponse, username: string, params: URLSearchParams, format: string) {
         const playlistId = params.get('playlistId')
         if (!playlistId) return this.sendError(res, 10, 'Required parameter is missing: playlistId', format)
+        if (playlistId === CUSTOM_DIRECTORY_PLAYLIST_ID) return this.sendError(res, 50, 'The local music directory is read-only', format)
         if (playlistId.startsWith('lb_')) return this.sendError(res, 0, '排行榜为只读播放列表，不支持修改', format)
         if (playlistId.startsWith('pl_')) return this.sendError(res, 0, '共享歌单为只读播放列表，不支持修改', format)
 
         try {
             const userSpace = getUserSpace(username)
-            const listData = await userSpace.listManage.getListData()
+            const listData = await this.getSubsonicListData(username)
             const userList = listData.userList.find(list => list.id === playlistId)
             if (playlistId !== 'default' && playlistId !== 'love' && !userList) {
                 return this.sendError(res, 70, 'Playlist not found', format)
@@ -1891,6 +1922,7 @@ class SubsonicHandler {
     private async handleDeletePlaylist(res: http.ServerResponse, username: string, params: URLSearchParams, format: string) {
         const id = params.get('id')
         if (!id) return this.sendError(res, 10, 'Required parameter is missing: id', format)
+        if (id === CUSTOM_DIRECTORY_PLAYLIST_ID) return this.sendError(res, 50, 'The local music directory is read-only', format)
         if (id.startsWith('lb_')) return this.sendError(res, 0, '排行榜为只读播放列表，不支持删除', format)
         if (id.startsWith('pl_')) return this.sendError(res, 0, '共享歌单为只读播放列表，不支持删除', format)
         if (id === 'default' || id === 'love') {
@@ -1899,7 +1931,7 @@ class SubsonicHandler {
 
         try {
             const userSpace = getUserSpace(username)
-            const listData = await userSpace.listManage.getListData()
+            const listData = await this.getSubsonicListData(username)
             if (!listData.userList.some(list => list.id === id)) {
                 return this.sendError(res, 70, 'Playlist not found', format)
             }
@@ -2226,13 +2258,18 @@ class SubsonicHandler {
         if (!id) return this.sendError(res, 10, 'Required parameter is missing: id', format)
 
         const userSpace = getUserSpace(username)
-        const listData = await userSpace.listManage.getListData()
+        const listData = await this.getSubsonicListData(username)
 
         let musics: LX.Music.MusicInfo[] = []
         let listName = 'Unknown'
         let albumPublishTime: string | undefined
 
-        if (id === 'love') {
+        if (id.startsWith('alb_local_')) {
+            const albumId = id.slice('alb_local_'.length)
+            musics = (await getCustomDirectoryMusic(username)).filter(music => music.meta.albumId === albumId)
+            if (!musics.length) return this.sendError(res, 70, 'Album not found', format)
+            listName = musics[0].meta.albumName
+        } else if (id === 'love') {
             musics = listData.loveList
             listName = '我的收藏'
         } else if (id === 'default') {
@@ -2466,8 +2503,8 @@ class SubsonicHandler {
             name: listName,
             title: listName,
             album: listName,
-            artist: (musics.length === 1) ? musics[0].singer : 'LX Music',
-            artistId: (musics.length === 1) ? ((musics[0] as any).singerId ? `art_${musics[0].source}_${(musics[0] as any).singerId}` : `artist_${(musics[0].singer || '').split('、')[0]}`) : 'artist_lxmusic',
+            artist: (musics.length === 1 || id.startsWith('alb_local_')) ? musics[0].singer : 'LX Music',
+            artistId: (musics.length === 1 || id.startsWith('alb_local_')) ? ((musics[0] as any).singerId ? `art_${musics[0].source}_${(musics[0] as any).singerId}` : `artist_${(musics[0].singer || '').split('、')[0]}`) : 'artist_lxmusic',
             songCount: musics.length,
             duration: musics.reduce((sum: number, m: any) => sum + this.parseDuration(m.interval), 0),
             created: new Date().toISOString(),
@@ -2508,7 +2545,7 @@ class SubsonicHandler {
         if (found) {
             music = found.music
             listId = found.listId
-        } else if (id.includes('_')) {
+        } else if (id.includes('_') && !isCustomDirectoryId(id)) {
             // 在线歌曲 ID 动态元数据兜底 (处理 wy_1378492134, tx_... 等客户端请求非本地库歌曲)
             const parts = id.split('_')
             const source = parts[0]
@@ -2537,9 +2574,9 @@ class SubsonicHandler {
     }
 
     private async handleGetMusicDirectory(res: http.ServerResponse, username: string, params: URLSearchParams, format: string) {
-        const id = params.get('id')
+        const id = params.get('id') === 'local' ? CUSTOM_DIRECTORY_PLAYLIST_ID : params.get('id')
         const userSpace = getUserSpace(username)
-        const listData = await userSpace.listManage.getListData()
+        const listData = await this.getSubsonicListData(username)
 
         if (!id || id === '1' || id === 'root') {
             const dirs = [
@@ -2756,6 +2793,8 @@ class SubsonicHandler {
         isV2: boolean,
     ) {
         const type = params.get('type') || 'newest'
+        const folder = params.get('musicFolderId') || '1'
+        const preferDirectory = ['1', 'local'].includes(folder) && (await getCustomDirectoryMusic(username)).length > 0
         const size = Math.min(parseInt(params.get('size') || '10'), 500)
         const offset = parseInt(params.get('offset') || '0')
         if (global.lx.config['subsonic.enableDebug']) {
@@ -2784,7 +2823,7 @@ class SubsonicHandler {
             }
         }
 
-        if (recommendPool.length === 0 && (type === 'recent' || type === 'newest' || type === 'random' || type === 'byGenre')) {
+        if (!preferDirectory && recommendPool.length === 0 && (type === 'recent' || type === 'newest' || type === 'random' || type === 'byGenre')) {
             try {
                 if (type === 'byGenre') {
                     const genreNameOrId = params.get('genre') || ''
@@ -2856,15 +2895,18 @@ class SubsonicHandler {
             // [兜底] 用户未必单独收藏过专辑（NAS 实测 library/albums.json 是空的），
             // 推荐接口又整批失败时，从本地歌曲反推专辑；还不够就用在线歌曲缓存补齐，
             // 避免「最近发行」这类标签页直接空白
-            if (pool.length < RECOMMEND_POOL_SIZE) {
+            if (preferDirectory || pool.length < RECOMMEND_POOL_SIZE) {
                 const seen = new Set<string>(pool.map(a => String(a.id)))
-                for (const a of await this.buildLocalAlbums(username, true)) {
+                for (const a of await this.buildLocalAlbums(username, !preferDirectory)) {
                     if (seen.has(String(a.id))) continue
                     seen.add(String(a.id))
                     pool.push(a)
                 }
             }
 
+            if (type === 'alphabeticalByName') pool.sort((a, b) => String(a.name).localeCompare(String(b.name)))
+            if (type === 'alphabeticalByArtist') pool.sort((a, b) => String(a.artist).localeCompare(String(b.artist)))
+            if (type === 'newest') pool.sort((a, b) => String(b.created).localeCompare(String(a.created)))
             if (type === 'random') {
                 for (let i = pool.length - 1; i > 0; i--) {
                     const j = Math.floor(Math.random() * (i + 1))
@@ -2900,17 +2942,20 @@ class SubsonicHandler {
      * 只收录带 albumId 的条目：没有 albumId 的专辑点进去拿不到曲目，宁可不显示。
      */
     private async buildLocalAlbums(username: string, includeOnlineCache: boolean): Promise<any[]> {
+        const seenSongs = new Set<string>()
         const collect = (songs: any[], out: Map<string, any>) => {
             for (const m of songs) {
-                if (!m) continue
+                if (!m || seenSongs.has(m.id)) continue
+                seenSongs.add(m.id)
                 const source = m.source || 'wy'
                 const albumName = String((m as any)?.meta?.albumName || (m as any)?.albumName || '').trim()
                 const albumId = String((m as any)?.meta?.albumId || (m as any)?.albumId || '').trim()
-                if (!albumId || !albumName || albumName === 'Unknown Album') continue
+                if (!albumId || !albumName || (albumName === 'Unknown Album' && !isCustomDirectoryId(m.id))) continue
                 const key = `${source}_${albumId}`
                 const exist = out.get(key)
                 if (exist) {
                     exist.songCount += 1
+                    exist.duration += this.parseDuration(m.interval)
                     continue
                 }
                 const primarySinger = String(m.singer || '').split('、')[0] || 'LX Music'
@@ -2922,10 +2967,10 @@ class SubsonicHandler {
                     artist: m.singer || 'LX Music',
                     artistId: (m as any).singerId ? `art_${source}_${(m as any).singerId}` : `artist_${primarySinger}`,
                     isDir: true,
-                    coverArt: (m as any)?.meta?.picUrl || (m as any)?.img || `alb_${source}_${albumId}`,
+                    coverArt: isCustomDirectoryId(m.id) ? m.id : (m as any)?.meta?.picUrl || (m as any)?.img || `alb_${source}_${albumId}`,
                     songCount: 1,
                     duration: this.parseDuration(m.interval),
-                    created: new Date().toISOString(),
+                    created: new Date(isCustomDirectoryId(m.id) ? (m as CustomDirectoryMusic).modifiedAt : Date.now()).toISOString(),
                     playCount: 0,
                 })
             }
@@ -2934,7 +2979,7 @@ class SubsonicHandler {
         const out = new Map<string, any>()
         try {
             const userSpace = getUserSpace(username)
-            const listData = await userSpace.listManage.getListData()
+            const listData = await this.getSubsonicListData(username)
             collect(listData.loveList || [], out)
             collect(listData.defaultList || [], out)
             for (const l of (listData.userList || [])) collect((l as any).list || [], out)
@@ -2963,7 +3008,7 @@ class SubsonicHandler {
      */
     private async buildArtistDirectory(username: string) {
         const userSpace = getUserSpace(username)
-        const listData = await userSpace.listManage.getListData()
+        const listData = await this.getSubsonicListData(username)
         const libArtists = await this.getLibraryData(username, 'artists')
         const libAlbums = await this.getLibraryData(username, 'albums')
         const meta = await this.getUserSubsonicMeta(username)
@@ -3043,7 +3088,10 @@ class SubsonicHandler {
         }
 
         // 2b. 从本地曲目反推歌手
+        const seenSongs = new Set<string>()
         for (const m of allSongs) {
+            if (seenSongs.has(m.id)) continue
+            seenSongs.add(m.id)
             const singer = m.singer || ''
             const primary = (singer.split('、')[0] || '').trim()
             if (!primary || primary === 'Unknown Artist') continue
@@ -3120,7 +3168,7 @@ class SubsonicHandler {
                 name: a.name,
                 albumCount: a.albumKeys.size,
                 songCount: a.songCount,
-                coverArt: a.id,
+                coverArt: a.songs.find((music: LX.Music.MusicInfo) => isCustomDirectoryId(music.id))?.id || a.id,
                 // 头像字段同样降尺寸：客户端直连时会直接下载，原图实测有 17.9MB
                 artistImageUrl: a.picUrl ? downscaleAvatarUrl(a.picUrl) : undefined,
                 ...(a.starred ? { starred: new Date().toISOString() } : {}),
@@ -3197,8 +3245,9 @@ class SubsonicHandler {
         const localEntry = directory.find(a => a.id === id)
             || (singerName && singerName !== 'Unknown' ? directory.find(a => a.name === singerName) : undefined)
         if (localEntry && (!singerName || singerName === 'Unknown')) singerName = localEntry.name
+        const isDirectoryArtist = !!localEntry?.songs.some((music: LX.Music.MusicInfo) => isCustomDirectoryId(music.id))
 
-        if (!artistId && singerName && singerName !== 'Unknown') {
+        if (!isDirectoryArtist && !artistId && singerName && singerName !== 'Unknown') {
             if (localEntry?.source && localEntry?.singerId) {
                 source = localEntry.source
                 artistId = String(localEntry.singerId)
@@ -3238,8 +3287,8 @@ class SubsonicHandler {
         //    把那些平台的专辑/歌曲也合并进来——各平台 mid 不通用，必须各自寻址。
         //    只配了 1 个源时行为不变（单源）。
         const sourceTargets: Array<{ source: string, id: string }> = []
-        if (artistId && artistId !== singerName) sourceTargets.push({ source, id: artistId })
-        if (singerName && singerName !== 'Unknown' && getOrderedSingerSources().length > 1) {
+        if (!isDirectoryArtist && artistId && artistId !== singerName) sourceTargets.push({ source, id: artistId })
+        if (!isDirectoryArtist && singerName && singerName !== 'Unknown' && getOrderedSingerSources().length > 1) {
             const hits = await resolveSingerSources(singerName).catch(() => [] as any[])
             for (const h of hits) {
                 if (!sourceTargets.some(t => t.source === h.source)) {
@@ -3384,7 +3433,7 @@ class SubsonicHandler {
                         artist: singerName,
                         artistId: resolvedId,
                         songCount: songs.length,
-                        coverArt: first.meta?.picUrl || first.img || albId,
+                        coverArt: isCustomDirectoryId(first.id) ? first.id : first.meta?.picUrl || first.img || albId,
                         isDir: true,
                     }
                 })
@@ -3418,7 +3467,7 @@ class SubsonicHandler {
             name: singerName,
             albumCount: albums.length,
             songCount: hotSongs.length,
-            coverArt: resolvedId,
+            coverArt: isDirectoryArtist ? localEntry!.songs.find((music: LX.Music.MusicInfo) => isCustomDirectoryId(music.id))!.id : resolvedId,
             // [修复] 没有封面时不能把 ID 令牌塞进 artistImageUrl（它是 URL 字段），
             // 否则客户端会把它当图片直链去请求而必然失败；应留空让客户端回落到 coverArt
             artistImageUrl: artistPic || undefined,
@@ -3995,7 +4044,7 @@ class SubsonicHandler {
 
         // 1. 汇总所有本地歌曲 (去重)
         const userSpace = getUserSpace(username)
-        const listData = await userSpace.listManage.getListData()
+        const listData = await this.getSubsonicListData(username)
 
         const allSongsMap = new Map<string, { music: LX.Music.MusicInfo, listId: string }>()
         const collectSongs = (list: LX.Music.MusicInfo[], listId: string) => {
@@ -4404,6 +4453,7 @@ class SubsonicHandler {
         const debug = !!global.lx.config['subsonic.enableDebug']
         if (debug) subsonicLog.debug(`[Subsonic][trace] resolveSongMeta ${id}: 第1步 查持久化(歌单/专辑库) + 内存/磁盘 onlineSongCache`)
         const found = await this.findMusicById(username, id)
+        if (isCustomDirectoryId(id)) return found
         if (found) {
             this.cacheOnlineSong(found.music)
             if (debug) subsonicLog.debug(`[Subsonic][trace] resolveSongMeta ${id}: 第1步命中 listId=${found.listId}, name=${found.music.name || '(空)'}`)
@@ -4920,7 +4970,7 @@ class SubsonicHandler {
 
     private async handleGetStarred(res: http.ServerResponse, username: string, format: string, isV2 = true) {
         const userSpace = getUserSpace(username)
-        const listData = await userSpace.listManage.getListData()
+        const listData = await this.getSubsonicListData(username)
         const meta = await this.getUserSubsonicMeta(username)
         const starredAlbumSet = new Set(meta.starredAlbums)
         const starredArtistSet = new Set(meta.starredArtists)
@@ -5017,7 +5067,7 @@ class SubsonicHandler {
         const size = Math.min(parseInt(params.get('size') || '10'), 100)
         const genreNameOrId = params.get('genre') || ''
         const userSpace = getUserSpace(username)
-        const listData = await userSpace.listManage.getListData()
+        const listData = await this.getSubsonicListData(username)
 
 
         const isGenreQuery = params.has('genre')
@@ -5133,7 +5183,7 @@ class SubsonicHandler {
      */
     private async pickSimilarEntries(username: string, id: string | null, count: number): Promise<Array<{ music: LX.Music.MusicInfo, listId: string }>> {
         const userSpace = getUserSpace(username)
-        const listData = await userSpace.listManage.getListData()
+        const listData = await this.getSubsonicListData(username)
 
         // 找到目标歌曲，优先从同一列表里挑相似（同歌手），找不到则随机
         const all: { music: LX.Music.MusicInfo, listId: string }[] = []
@@ -5594,6 +5644,11 @@ class SubsonicHandler {
     ) {
         const id = params.get('id')
         if (!id) return this.sendError(res, 10, 'Required parameter is missing: id', format)
+        if (isCustomDirectoryId(id)) {
+            const music = await findCustomDirectoryMusic(username, id)
+            if (!music) return this.sendError(res, 70, 'Song not found', format)
+            return serveCustomDirectoryMusic(req, res, username, music)
+        }
 
         // 解析 source 和 songmid
         let source = ''
@@ -6039,6 +6094,20 @@ class SubsonicHandler {
         try {
             // 0. 剥离前缀 (al-, ar-, tr-, sg-, mg-) 并处理 URL
             id = id.replace(/^(al-|ar-|tr-|sg-|mg-)/, '')
+            if (isCustomDirectoryId(id) || id.startsWith('alb_local_')) {
+                const music = isCustomDirectoryId(id)
+                    ? await findCustomDirectoryMusic(username, id)
+                    : (await getCustomDirectoryMusic(username)).find(item => `alb_local_${item.meta.albumId}` === id)
+                if (!music) return this.sendError(res, 70, 'Cover not found', format)
+                const cover = await getCustomDirectoryCover(username, music)
+                if (cover) {
+                    res.writeHead(200, { 'Content-Type': cover.mime, 'Cache-Control': 'private, max-age=3600' })
+                    return res.end(cover.data)
+                }
+                const logo = path.join(global.lx.staticPath, 'music/assets/logo.svg')
+                res.writeHead(200, { 'Content-Type': 'image/svg+xml' })
+                return fs.createReadStream(logo).pipe(res)
+            }
             if (id === 'logo') {
                 const logoPath = path.join(global.lx.staticPath, 'music/assets/logo.svg')
                 if (fs.existsSync(logoPath)) {
@@ -6085,7 +6154,7 @@ class SubsonicHandler {
             // [新增] 兼容逻辑：处理不规范的 ID（如原始 albumMid）
             if (!id.includes('_')) {
                 const userSpace = getUserSpace(username)
-                const listData = await userSpace.listManage.getListData()
+                const listData = await this.getSubsonicListData(username)
                 const allMusics = [...listData.loveList, ...listData.defaultList, ...listData.userList.flatMap(l => (l.list || []) as LX.Music.MusicInfo[])]
                 const matched = allMusics.find((m: any) => m.meta?.albumId === id || m.meta?.albumMid === id)
                 if (matched) {
@@ -6250,7 +6319,7 @@ class SubsonicHandler {
 
             // 3. 尝试作为歌单 ID 处理
             const userSpace = getUserSpace(username)
-            const listData = await userSpace.listManage.getListData()
+            const listData = await this.getSubsonicListData(username)
 
             let listMusics: LX.Music.MusicInfo[] = []
             if (id === 'love') {
@@ -6719,7 +6788,7 @@ class SubsonicHandler {
         // 2. 兜底逻辑：如果在 SDK/库里没找到，搜索本地所有播放列表
         if (picked.length === 0) {
             const userSpace = getUserSpace(username)
-            const listData = await userSpace.listManage.getListData()
+            const listData = await this.getSubsonicListData(username)
             const all: { music: LX.Music.MusicInfo, listId: string }[] = []
             const addAll = (musics: LX.Music.MusicInfo[], listId: string) => {
                 for (const m of musics) {
@@ -6804,7 +6873,7 @@ class SubsonicHandler {
 
         // 尝试通过歌手和标题反查歌曲 ID
         const userSpace = getUserSpace(username)
-        const listData = await userSpace.listManage.getListData()
+        const listData = await this.getSubsonicListData(username)
         const all: LX.Music.MusicInfo[] = [
             ...listData.loveList,
             ...listData.defaultList,
@@ -6901,6 +6970,22 @@ class SubsonicHandler {
     private async handleGetLyricsBySongId(res: http.ServerResponse, username: string, params: URLSearchParams, format: string) {
         const id = params.get('id')
         if (!id) return this.sendError(res, 10, 'Required parameter is missing: id', format)
+        if (isCustomDirectoryId(id)) {
+            const music = await findCustomDirectoryMusic(username, id)
+            if (!music) return this.sendError(res, 70, 'Song not found', format)
+            const value = getCustomDirectoryLyrics(username, music)
+            if (format === 'json') {
+                const line = this.parseLrc(value)
+                return this.sendResponse(res, {
+                    lyrics: { artist: music.singer, title: music.name, value },
+                    lyricsList: { structuredLyrics: [{
+                        displayArtist: music.singer, displayTitle: music.name,
+                        lang: 'und', synced: line.some(item => item.start !== undefined), line,
+                    }] },
+                }, format)
+            }
+            return this.sendResponse(res, { lyrics: { attrs: { artist: music.singer, title: music.name }, children: value } }, format)
+        }
 
         // 解析 source 和 songmid
         let source = ''
