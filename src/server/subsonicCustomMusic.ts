@@ -73,7 +73,7 @@ export const refreshCustomDirectoryMusic = async (username: string) => {
 }
 
 /** Validate the current user's root again at read time, including symlink escapes. */
-const resolveFile = (username: string, music: CustomDirectoryMusic) => {
+export const resolveCustomDirectoryFile = (username: string, music: CustomDirectoryMusic) => {
     if (!global.lx.config['user.enableCustomMusicDir'] || !validRelativeFile(music.customFile)) return null
     const configuredRoot = getCustomMusicDir(username)
     if (!configuredRoot) return null
@@ -88,12 +88,12 @@ const resolveFile = (username: string, music: CustomDirectoryMusic) => {
 }
 
 export const getCustomDirectoryCover = (username: string, music: CustomDirectoryMusic) => {
-    if (!resolveFile(username, music)) return null
+    if (!resolveCustomDirectoryFile(username, music)) return null
     return getCustomCover(music.customFile, username)
 }
 
 export const getCustomDirectoryLyrics = (username: string, music: CustomDirectoryMusic): string => {
-    if (!resolveFile(username, music)) return ''
+    if (!resolveCustomDirectoryFile(username, music)) return ''
     return getCustomLocalLyrics(music.customFile, username).lrc
 }
 
@@ -107,7 +107,7 @@ export const customDirectoryQuality = (music: CustomDirectoryMusic) => ({
 export const serveCustomDirectoryMusic = async (
     req: http.IncomingMessage, res: http.ServerResponse, username: string, music: CustomDirectoryMusic,
 ) => {
-    let file = resolveFile(username, music)
+    let file = resolveCustomDirectoryFile(username, music)
     if (!file) {
         res.writeHead(404)
         res.end('File not found')

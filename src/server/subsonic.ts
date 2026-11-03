@@ -8,8 +8,12 @@ import { downloadAndCache, checkCache, serveCacheFile } from '@/server/fileCache
 import {
     CUSTOM_DIRECTORY_PLAYLIST_ID, customDirectoryQuality, findCustomDirectoryMusic,
     getCustomDirectoryCover, getCustomDirectoryLyrics, getCustomDirectoryMusic,
-    isCustomDirectoryId, refreshCustomDirectoryMusic, serveCustomDirectoryMusic, type CustomDirectoryMusic,
+    isCustomDirectoryId, refreshCustomDirectoryMusic, resolveCustomDirectoryFile,
+    serveCustomDirectoryMusic, type CustomDirectoryMusic,
 } from './subsonicCustomMusic'
+import { getCustomMusicDir } from './customMusicManager'
+import { LISTEN_ROOM_MAX_BODY_BYTES, LISTEN_ROOM_METHODS, ListenRoomError, listenRoomStore } from './listenRooms'
+import { popularFavoriteSongs } from './popularFavoriteSongs'
 import {
     getSingerPic, getSingerDetail, getSingerMid, nameSimilarity,
     resolveSingerSources, getOrderedSingerSources, normalizeName as normalizeSingerName,
@@ -48,6 +52,39 @@ import { getMusicInfo as mgGetMusicInfo } from '@/modules/utils/musicSdk/mg/musi
 import bdMusicInfo from '@/modules/utils/musicSdk/bd/musicInfo.js'
 import { spawn } from 'child_process'
 const musicSdk = musicSdkRaw as any
+
+/** Bound only the new polling API; legacy Subsonic POST behavior stays intact. */
+function readListenRoomBody(req: http.IncomingMessage): Promise<URLSearchParams> {
+    return new Promise((resolve, reject) => {
+        const declared = Number(req.headers['content-length'] || 0)
+        if (Number.isFinite(declared) && declared > LISTEN_ROOM_MAX_BODY_BYTES) {
+            req.resume()
+            reject(new ListenRoomError(10, 'Listen-room request too large'))
+            return
+        }
+        const chunks: Buffer[] = []
+        let size = 0
+        let rejected = false
+        req.on('data', (chunk: Buffer | string) => {
+            if (rejected) return
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+            size += buf.length
+            if (size > LISTEN_ROOM_MAX_BODY_BYTES) {
+                rejected = true
+                chunks.length = 0
+                reject(new ListenRoomError(10, 'Listen-room request too large'))
+                req.resume()
+                return
+            }
+            chunks.push(buf)
+        })
+        req.once('end', () => {
+            if (!rejected) resolve(new URLSearchParams(Buffer.concat(chunks).toString('utf8')))
+        })
+        req.once('aborted', () => reject(new ListenRoomError(0, 'Listen-room request interrupted')))
+        req.once('error', () => reject(new ListenRoomError(0, 'Listen-room request interrupted')))
+    })
+}
 
 // 服务端签名票据密钥
 // ─────────────────────────────────────────────
@@ -1067,18 +1104,25 @@ class SubsonicHandler {
     // ─────────────────────────────────────────────
 
     async handleRequest(req: http.IncomingMessage, res: http.ServerResponse, urlObj: URL) {
+        const { pathname } = urlObj
+        const method = pathname.split('/').pop()?.split('.')[0] || ''
+        const isListenRoom = LISTEN_ROOM_METHODS.has(method)
+        const isPopularFavorite = method === 'getPopularFavoriteSongs'
+        const isBoundedExtension = isListenRoom || isPopularFavorite
         let params = urlObj.searchParams
 
         // [修复] 处理 POST 请求体中的参数 (如 Feishin 客户端)
         if (req.method === 'POST') {
             try {
-                const bodyParams = await new Promise<URLSearchParams>((resolve) => {
-                    let body = ''
-                    req.on('data', chunk => { body += chunk })
-                    req.on('end', () => {
-                        resolve(new URLSearchParams(body))
+                const bodyParams = isBoundedExtension
+                    ? await readListenRoomBody(req)
+                    : await new Promise<URLSearchParams>((resolve) => {
+                        let body = ''
+                        req.on('data', chunk => { body += chunk })
+                        req.on('end', () => {
+                            resolve(new URLSearchParams(body))
+                        })
                     })
-                })
                 // 合并 URL 参数和 Body 参数
                 const mergedParams = new URLSearchParams(params.toString())
                 for (const key of new Set(bodyParams.keys())) {
@@ -1087,13 +1131,50 @@ class SubsonicHandler {
                 }
                 params = mergedParams
             } catch (e) {
+                if (isBoundedExtension) {
+                    res.setHeader('Cache-Control', 'no-store')
+                    return this.sendError(res, e instanceof ListenRoomError ? e.code : 0,
+                        e instanceof ListenRoomError ? e.message : 'Request body failed', 'json')
+                }
                 subsonicLog.error('[Subsonic] POST body parse error:', e)
             }
         }
 
-        const format = params.get('f') === 'json' ? 'json' : 'xml'
-        const { pathname } = urlObj
-        const method = pathname.split('/').pop()?.split('.')[0] || ''
+        const format = isBoundedExtension || params.get('f') === 'json' ? 'json' : 'xml'
+
+        if (isListenRoom) {
+            res.setHeader('Cache-Control', 'no-store')
+            // These interfaces accept token/salt authentication only, never passwords.
+            if (req.method !== 'POST') {
+                req.resume()
+                return this.sendError(res, 0, 'Listen-room requests require POST', format)
+            }
+            if (Buffer.byteLength(urlObj.search, 'utf8') > LISTEN_ROOM_MAX_BODY_BYTES ||
+                ['p', 'password', 'passwd', 'streamUrl', 'audioUrl', 'url', 'accessToken'].some(key => params.has(key))) {
+                return this.sendError(res, 10, 'Invalid listen-room parameters', format)
+            }
+            if (!params.get('t') || !params.get('s')) return this.sendError(res, 40, 'Wrong username or password', format)
+        }
+
+        if (isPopularFavorite) {
+            res.setHeader('Cache-Control', 'no-store')
+            // GET uses headers for credentials; POST can use the usual form body.
+            // Never accept credentials in URLs where proxies may log them.
+            if (req.method !== 'GET' && req.method !== 'POST') {
+                req.resume()
+                return this.sendError(res, 0, 'GET or POST required', format)
+            }
+            if (Buffer.byteLength(urlObj.search, 'utf8') > LISTEN_ROOM_MAX_BODY_BYTES ||
+                ['u', 't', 's', 'p', 'password', 'passwd'].some(key => urlObj.searchParams.has(key)) ||
+                ['p', 'password', 'passwd'].some(key => params.has(key))) {
+                return this.sendError(res, 10, 'Invalid authentication parameters', format)
+            }
+            for (const [name, header] of [['u', 'x-subsonic-user'], ['t', 'x-subsonic-token'], ['s', 'x-subsonic-salt']]) {
+                const value = req.headers[header]
+                if (!params.has(name) && typeof value === 'string') params.set(name, value)
+            }
+            if (!params.get('u') || !params.get('t') || !params.get('s')) return this.sendError(res, 40, 'Wrong username or password', format)
+        }
 
         // 常规鉴权：u + (t&s) 或 u + p
         let username = this.verifyAuth(params)
@@ -1104,6 +1185,48 @@ class SubsonicHandler {
         }
         if (!username) {
             return this.sendError(res, 40, 'Wrong username or password', format)
+        }
+
+        if (isListenRoom) {
+            // Do not log parameters: room IDs and authentication values are secrets.
+            try {
+                const id = params.get('roomId') || ''
+                if (method !== 'createListenRoom' && !id) return this.sendError(res, 10, 'Required parameter is missing: roomId', format)
+                switch (method) {
+                    case 'createListenRoom': return this.sendResponse(res, { listenRoom: listenRoomStore.create(username) }, format)
+                    case 'joinListenRoom': return this.sendResponse(res, { listenRoom: listenRoomStore.join(id, username) }, format)
+                    case 'getListenRoom': return this.sendResponse(res, { listenRoom: listenRoomStore.get(id, username) }, format)
+                    case 'updateListenRoom': return this.sendResponse(res, { listenRoom: listenRoomStore.update(id, username, params) }, format)
+                    case 'leaveListenRoom':
+                        listenRoomStore.leave(id, username)
+                        return this.sendResponse(res, {}, format)
+                }
+            } catch (e) {
+                if (e instanceof ListenRoomError) return this.sendError(res, e.code, e.message, format)
+                subsonicLog.error('[Subsonic] Listen-room request failed')
+                return this.sendError(res, 0, 'Listen-room request failed', format)
+            }
+        }
+        if (isPopularFavorite) {
+            const sizeValue = params.get('size') ?? '30'
+            if (!/^\d+$/.test(sizeValue) || Number(sizeValue) < 1 || Number(sizeValue) > 30) {
+                return this.sendError(res, 10, 'size must be an integer between 1 and 30', format)
+            }
+            try {
+                const result = await popularFavoriteSongs.get()
+                return this.sendResponse(res, { popularFavoriteSongs: {
+                    ...result,
+                    song: result.song.slice(0, Number(sizeValue)).map(item => ({
+                        ...this.musicToSongFlat(item.music, 'popular-favorite', undefined, username),
+                        favoriteCount: item.favoriteCount,
+                        favoriteSource: 'netease',
+                        favoriteUpdatedAtMs: item.favoriteUpdatedAtMs,
+                    })),
+                } }, format)
+            } catch {
+                subsonicLog.warn('[Subsonic] Popular favorite songs unavailable')
+                return this.sendError(res, 0, 'Popular favorite songs temporarily unavailable', format)
+            }
         }
         this.currentUsername = username
 
@@ -1547,10 +1670,43 @@ class SubsonicHandler {
         return { attrs: this.musicToSongFlat(music, parentId, artistIdOverride, username) }
     }
 
+    /**
+     * Room snapshots keep their original song ID. Local IDs include the owner name,
+     * so resolve the identical file through the requesting member's own enabled
+     * library and index. Membership alone never grants access to an owner's file.
+     */
+    private async findAccessibleCustomMusic(username: string, id: string): Promise<CustomDirectoryMusic | null> {
+        const own = await findCustomDirectoryMusic(username, id)
+        if (own) return own
+        const targetRoot = getCustomMusicDir(username)
+        if (!targetRoot || !global.lx.config['user.enableCustomMusicDir']) return null
+
+        for (const owner of listenRoomStore.sharedSongOwners(username, id)) {
+            const original = await findCustomDirectoryMusic(owner, id)
+            if (!original) continue
+            const sourcePath = resolveCustomDirectoryFile(owner, original)
+            if (!sourcePath) continue
+            try {
+                const realRoot = fs.realpathSync(targetRoot)
+                const relative = path.relative(realRoot, sourcePath)
+                if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue
+                const ownId = `localdir_${crypto.createHash('sha256').update(`${username}\0${relative}`).digest('hex').slice(0, 32)}`
+                const match = await findCustomDirectoryMusic(username, ownId)
+                if (!match || match.customFile !== relative || resolveCustomDirectoryFile(username, match) !== sourcePath) continue
+                // Membership or the current song could change during the disk lookups.
+                if (!listenRoomStore.sharedSongOwners(username, id).includes(owner)) continue
+                return match
+            } catch {
+                // Missing paths, changed permissions and stale indexes fail closed.
+            }
+        }
+        return null
+    }
+
     /** 查找某个用户下所有列表中的某首歌 */
     private async findMusicById(username: string, id: string): Promise<{ music: LX.Music.MusicInfo, listId: string } | null> {
         if (isCustomDirectoryId(id)) {
-            const music = await findCustomDirectoryMusic(username, id)
+            const music = await this.findAccessibleCustomMusic(username, id)
             return music ? { music, listId: CUSTOM_DIRECTORY_PLAYLIST_ID } : null
         }
         // [修复] 读取前确保磁盘上的 onlineSongCache 已加载（之前只在 cacheOnlineSong 写入时触发，
@@ -5645,7 +5801,7 @@ class SubsonicHandler {
         const id = params.get('id')
         if (!id) return this.sendError(res, 10, 'Required parameter is missing: id', format)
         if (isCustomDirectoryId(id)) {
-            const music = await findCustomDirectoryMusic(username, id)
+            const music = await this.findAccessibleCustomMusic(username, id)
             if (!music) return this.sendError(res, 70, 'Song not found', format)
             return serveCustomDirectoryMusic(req, res, username, music)
         }
@@ -6096,7 +6252,7 @@ class SubsonicHandler {
             id = id.replace(/^(al-|ar-|tr-|sg-|mg-)/, '')
             if (isCustomDirectoryId(id) || id.startsWith('alb_local_')) {
                 const music = isCustomDirectoryId(id)
-                    ? await findCustomDirectoryMusic(username, id)
+                    ? await this.findAccessibleCustomMusic(username, id)
                     : (await getCustomDirectoryMusic(username)).find(item => `alb_local_${item.meta.albumId}` === id)
                 if (!music) return this.sendError(res, 70, 'Cover not found', format)
                 const cover = await getCustomDirectoryCover(username, music)
@@ -6971,7 +7127,7 @@ class SubsonicHandler {
         const id = params.get('id')
         if (!id) return this.sendError(res, 10, 'Required parameter is missing: id', format)
         if (isCustomDirectoryId(id)) {
-            const music = await findCustomDirectoryMusic(username, id)
+            const music = await this.findAccessibleCustomMusic(username, id)
             if (!music) return this.sendError(res, 70, 'Song not found', format)
             const value = getCustomDirectoryLyrics(username, music)
             if (format === 'json') {

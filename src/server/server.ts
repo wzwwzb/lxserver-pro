@@ -1194,8 +1194,6 @@ const handleStartServer = async (port = 9527, ip = '0.0.0.0') => await new Promi
     }
 
     const ip = getIP(req)
-    accessLog.info(`${req.method} ${req.url} from ${ip}`)
-    // console.log(req.url)
     const urlObj = new URL(req.url ?? '', `http://${req.headers.host}`)
     const pathname = urlObj.pathname
 
@@ -1207,6 +1205,9 @@ const handleStartServer = async (port = 9527, ip = '0.0.0.0') => await new Promi
     // 而本段判断先于下方的 Subsonic 路由执行，导致自定义 subsonic.path 会被当成播放器请求、后端接口整个失效。
     const subsonicPath = normalizePath(global.lx.config['subsonic.path'] || '/rest') || '/rest'
     const isSubsonicRequest = pathname === subsonicPath || pathname.startsWith(subsonicPath + '/')
+    // Subsonic clients may place passwords/tokens or a listen-room code in the
+    // query string. Keep the route for diagnostics, never the query contents.
+    accessLog.info(`${req.method} ${isSubsonicRequest ? pathname : req.url} from ${ip}`)
 
     // [修复] 判断是否为 LX 同步客户端协议路由 (如 /hello, /id, /ah 以及 /<username>/hello, /<username>/ah 等)
     const isSyncProtocolRequest = /^\/([^/]+\/)?(hello|id|ah)$/.test(pathname)
